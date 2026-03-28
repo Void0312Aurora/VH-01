@@ -1,0 +1,46 @@
+seed: 7
+output_dir: runs/shorttrain
+data:
+  kind: synthetic
+  train_size: 2048
+  val_size: 256
+  seq_len: 8
+  image_size: 32
+  channels: 3
+  num_workers: 4
+  root: ""
+  manifest_path: ""
+  val_manifest_path: ""
+
+model:
+  latent_dim: 48
+  cond_dim: 64
+  hidden_dim: 128
+  base_channels: 24
+
+train:
+  batch_size: 32
+  epochs: 6
+  lr: 0.0003
+  weight_decay: 0.00001
+  amp: true
+  log_every: 10
+  sample_every: 1
+  gradient_clip_norm: 1.0
+  device: auto
+  stage1_epochs: 1
+  stage2_epochs: 2
+  stage3_epochs: 3
+
+loss:
+  base_weight: 1.0
+  rep_weight: 0.05
+  dyn_weight: 0.5
+  cond_weight: 0.25
+  reg_weight: 0.01
+  gap_weight: 0.25
+  condition_dyn_weight: 0.5
+  delta_reg_weight: 0.5
+  delta_temporal_weight: 0.5
+  hard_negative_prob: 0.75
+  max_negative_edits: 2

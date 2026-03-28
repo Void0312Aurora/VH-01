@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vh-mvp"
+version = "0.1.0"
+description = "Minimal MVP for condition-aware video dynamics with residual consistency."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "einops>=0.8.0",
+  "matplotlib>=3.9.0",
+  "numpy>=2.1.0",
+  "pillow>=10.4.0",
+  "pyyaml>=6.0.2",
+  "torch>=2.8.0",
+  "torchvision>=0.23.0",
+  "tqdm>=4.66.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

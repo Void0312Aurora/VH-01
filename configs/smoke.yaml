@@ -1,0 +1,46 @@
+seed: 7
+output_dir: runs/smoke
+data:
+  kind: synthetic
+  train_size: 128
+  val_size: 32
+  seq_len: 8
+  image_size: 32
+  channels: 3
+  num_workers: 0
+  root: ""
+  manifest_path: ""
+  val_manifest_path: ""
+
+model:
+  latent_dim: 32
+  cond_dim: 32
+  hidden_dim: 64
+  base_channels: 16
+
+train:
+  batch_size: 8
+  epochs: 2
+  lr: 0.0003
+  weight_decay: 0.00001
+  amp: false
+  log_every: 1
+  sample_every: 1
+  gradient_clip_norm: 1.0
+  device: auto
+  stage1_epochs: 0
+  stage2_epochs: 1
+  stage3_epochs: 1
+
+loss:
+  base_weight: 1.0
+  rep_weight: 0.05
+  dyn_weight: 0.5
+  cond_weight: 0.25
+  reg_weight: 0.01
+  gap_weight: 0.25
+  condition_dyn_weight: 0.5
+  delta_reg_weight: 0.5
+  delta_temporal_weight: 0.5
+  hard_negative_prob: 0.75
+  max_negative_edits: 2

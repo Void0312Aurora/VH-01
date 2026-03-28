@@ -1,0 +1,51 @@
+seed: 7
+output_dir: runs/real_ucf101_subset_semantic_expanded
+
+data:
+  kind: folder
+  root: data/real/ucf101_subset_semantic
+  manifest_path: data/real/ucf101_subset_semantic/train.jsonl
+  val_manifest_path: data/real/ucf101_subset_semantic/val.jsonl
+  train_size: 0
+  val_size: 0
+  seq_len: 8
+  image_size: 32
+  channels: 3
+  num_workers: 4
+
+model:
+  latent_dim: 64
+  cond_dim: 64
+  hidden_dim: 128
+  base_channels: 32
+  condition_score_mode: energy
+  energy_hidden_dim: 128
+
+train:
+  batch_size: 8
+  epochs: 4
+  lr: 0.0003
+  weight_decay: 0.00001
+  amp: true
+  log_every: 20
+  sample_every: 1
+  gradient_clip_norm: 1.0
+  device: auto
+  stage1_epochs: 0
+  stage2_epochs: 0
+  stage3_epochs: 0
+
+loss:
+  base_weight: 1.0
+  rep_weight: 0.05
+  loc_weight: 0.05
+  loc_eps: 0.01
+  dyn_weight: 0.5
+  cond_weight: 0.5
+  reg_weight: 0.01
+  gap_weight: 0.5
+  condition_dyn_weight: 0.5
+  delta_reg_weight: 0.5
+  delta_temporal_weight: 0.5
+  hard_negative_prob: 0.75
+  max_negative_edits: 2

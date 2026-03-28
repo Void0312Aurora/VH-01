@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+
+# Notebooks / local experiments
+.ipynb_checkpoints/
+
+# Editors / OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project-generated artifacts
+runs/
+data/
