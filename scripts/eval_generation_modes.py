@@ -11,8 +11,14 @@ import torch
 
 from vh_mvp.config import load_config
 from vh_mvp.data import FolderVideoDataset, build_condition_catalog, condition_tuple_from_tensor
+from vh_mvp.losses import response_signature_dim
 from vh_mvp.models import VideoDynamicsMVP
-from vh_mvp.support import build_candidate_posterior, candidate_sets_from_posterior, condition_key
+from vh_mvp.support import (
+    build_candidate_posterior,
+    candidate_sets_from_posterior,
+    condition_key,
+    query_responsive_selection,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-source", type=str, default="both", choices=("train", "val", "both"))
     parser.add_argument("--alpha", type=float, default=0.90)
     parser.add_argument("--posterior-temperature", type=float, default=1.0)
+    parser.add_argument("--obs-alpha", type=float, default=0.90)
+    parser.add_argument("--plan-core-alpha", type=float, default=0.50)
     parser.add_argument("--max-samples", type=int, default=80)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=7)
@@ -59,6 +67,21 @@ def build_model_from_config(config_path: str, checkpoint_path: str, device: torc
         identity_hidden_dim=cfg.model.identity_hidden_dim,
         semantic_num_classes=cfg.model.semantic_num_classes,
         semantic_temperature=cfg.model.semantic_temperature,
+        chart_hidden_dim=cfg.model.chart_hidden_dim,
+        chart_num_experts=cfg.model.chart_num_experts,
+        chart_mode=cfg.model.chart_mode,
+        chart_residual_scale=cfg.model.chart_residual_scale,
+        chart_temporal_hidden_dim=cfg.model.chart_temporal_hidden_dim,
+        chart_temporal_kernel_size=cfg.model.chart_temporal_kernel_size,
+        state_cov_proj_dim=cfg.model.state_cov_proj_dim,
+        response_signature_dim=response_signature_dim(cfg.data.seq_len, cfg.model.response_signature_mode),
+        response_context_dim=cfg.model.response_context_dim,
+        local_measure_hidden_dim=cfg.model.local_measure_hidden_dim,
+        local_measure_rank=cfg.model.local_measure_rank,
+        local_measure_eps=cfg.model.local_measure_eps,
+        local_diffusion_mode=cfg.model.local_diffusion_mode,
+        local_diffusion_condition_mode=cfg.model.local_diffusion_condition_mode,
+        measure_density_mode=cfg.model.measure_density_mode,
     ).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=False)
@@ -132,6 +155,8 @@ def evaluate_generation_modes(
     catalog,
     alpha: float,
     posterior_temperature: float,
+    obs_alpha: float,
+    plan_core_alpha: float,
     max_samples: int,
     device: torch.device,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -141,9 +166,9 @@ def evaluate_generation_modes(
 
     rows: list[dict[str, object]] = []
     summary_buckets = {
-        "true": {"count": 0.0, "avg_set_size": 0.0, "avg_direct_query_mse": 0.0, "avg_support_top1_mse": 0.0, "avg_set_best_mse": 0.0, "avg_full_oracle_mse": 0.0, "avg_gain_support_vs_direct": 0.0, "avg_gain_set_vs_direct": 0.0, "avg_gap_set_to_full": 0.0},
-        "near": {"count": 0.0, "avg_set_size": 0.0, "avg_direct_query_mse": 0.0, "avg_support_top1_mse": 0.0, "avg_set_best_mse": 0.0, "avg_full_oracle_mse": 0.0, "avg_gain_support_vs_direct": 0.0, "avg_gain_set_vs_direct": 0.0, "avg_gap_set_to_full": 0.0},
-        "far": {"count": 0.0, "avg_set_size": 0.0, "avg_direct_query_mse": 0.0, "avg_support_top1_mse": 0.0, "avg_set_best_mse": 0.0, "avg_full_oracle_mse": 0.0, "avg_gain_support_vs_direct": 0.0, "avg_gain_set_vs_direct": 0.0, "avg_gap_set_to_full": 0.0},
+        "true": {"count": 0.0, "avg_set_size": 0.0, "avg_exec_set_size": 0.0, "query_responsive_fallback_rate": 0.0, "avg_direct_query_mse": 0.0, "avg_support_top1_mse": 0.0, "avg_query_responsive_mse": 0.0, "avg_set_best_mse": 0.0, "avg_full_oracle_mse": 0.0, "avg_gain_support_vs_direct": 0.0, "avg_gain_query_responsive_vs_direct": 0.0, "avg_gain_set_vs_direct": 0.0, "avg_gap_query_responsive_to_full": 0.0, "avg_gap_set_to_full": 0.0},
+        "near": {"count": 0.0, "avg_set_size": 0.0, "avg_exec_set_size": 0.0, "query_responsive_fallback_rate": 0.0, "avg_direct_query_mse": 0.0, "avg_support_top1_mse": 0.0, "avg_query_responsive_mse": 0.0, "avg_set_best_mse": 0.0, "avg_full_oracle_mse": 0.0, "avg_gain_support_vs_direct": 0.0, "avg_gain_query_responsive_vs_direct": 0.0, "avg_gain_set_vs_direct": 0.0, "avg_gap_query_responsive_to_full": 0.0, "avg_gap_set_to_full": 0.0},
+        "far": {"count": 0.0, "avg_set_size": 0.0, "avg_exec_set_size": 0.0, "query_responsive_fallback_rate": 0.0, "avg_direct_query_mse": 0.0, "avg_support_top1_mse": 0.0, "avg_query_responsive_mse": 0.0, "avg_set_best_mse": 0.0, "avg_full_oracle_mse": 0.0, "avg_gain_support_vs_direct": 0.0, "avg_gain_query_responsive_vs_direct": 0.0, "avg_gain_set_vs_direct": 0.0, "avg_gap_query_responsive_to_full": 0.0, "avg_gap_set_to_full": 0.0},
     }
 
     for index in range(min(len(dataset), max_samples)):
@@ -154,6 +179,8 @@ def evaluate_generation_modes(
         label = str(sample["label"])
 
         latents = model.encode_video(video)
+        obs_logits = model.condition_candidate_logits(latents, candidate_conditions)
+        obs_posterior = build_candidate_posterior(obs_logits, temperature=posterior_temperature)
         z_start = latents[:, 0].expand(num_candidates, -1)
         rollout_latents, _ = model.rollout_from(z_start, cond_embed_all, steps=video.size(1) - 1)
         rollout_video = model.decode_video(rollout_latents, cond_embed_all)
@@ -177,16 +204,26 @@ def evaluate_generation_modes(
             support_logits = -model.condition_alignment_energy(rollout_latents, query_embed).unsqueeze(0)
             posterior = build_candidate_posterior(support_logits, temperature=posterior_temperature)
             candidate_set = candidate_sets_from_posterior(posterior, [alpha])[alpha]
+            qr_selection = query_responsive_selection(
+                obs_posterior=obs_posterior,
+                plan_posterior=posterior,
+                obs_alpha=obs_alpha,
+                plan_core_alpha=plan_core_alpha,
+            )
             member_indices = candidate_set.member_indices()[0]
 
             direct_query_idx = int(query_idx)
             support_top1_idx = int(posterior.top1_idx[0].item())
+            query_responsive_idx = int(qr_selection.selected_idx[0].item())
             set_best_idx = min(member_indices, key=lambda idx: float(future_mse[idx].item()))
 
             direct_query_mse = float(future_mse[direct_query_idx].item())
             support_top1_mse = float(future_mse[support_top1_idx].item())
+            query_responsive_mse = float(future_mse[query_responsive_idx].item())
             set_best_mse = float(future_mse[set_best_idx].item())
             set_size = int(candidate_set.k_alpha[0].item())
+            exec_set_size = len(qr_selection.member_indices()[0])
+            qr_fallback = int(qr_selection.used_plan_core_fallback[0].item())
 
             rows.append(
                 {
@@ -197,15 +234,21 @@ def evaluate_generation_modes(
                     "query_condition": condition_key(catalog.keys[query_idx]),
                     "direct_query_condition": condition_key(catalog.keys[direct_query_idx]),
                     "support_top1_condition": condition_key(catalog.keys[support_top1_idx]),
+                    "query_responsive_condition": condition_key(catalog.keys[query_responsive_idx]),
                     "set_best_condition": condition_key(catalog.keys[set_best_idx]),
                     "full_oracle_condition": condition_key(catalog.keys[full_oracle_idx]),
                     "set_size": set_size,
+                    "exec_set_size": exec_set_size,
+                    "query_responsive_fallback": qr_fallback,
                     "direct_query_mse": direct_query_mse,
                     "support_top1_mse": support_top1_mse,
+                    "query_responsive_mse": query_responsive_mse,
                     "set_best_mse": set_best_mse,
                     "full_oracle_mse": full_oracle_mse,
                     "gain_support_vs_direct": direct_query_mse - support_top1_mse,
+                    "gain_query_responsive_vs_direct": direct_query_mse - query_responsive_mse,
                     "gain_set_vs_direct": direct_query_mse - set_best_mse,
+                    "gap_query_responsive_to_full": query_responsive_mse - full_oracle_mse,
                     "gap_set_to_full": set_best_mse - full_oracle_mse,
                 }
             )
@@ -214,12 +257,17 @@ def evaluate_generation_modes(
                 summary_buckets[query_name],
                 {
                     "avg_set_size": set_size,
+                    "avg_exec_set_size": exec_set_size,
+                    "query_responsive_fallback_rate": qr_fallback,
                     "avg_direct_query_mse": direct_query_mse,
                     "avg_support_top1_mse": support_top1_mse,
+                    "avg_query_responsive_mse": query_responsive_mse,
                     "avg_set_best_mse": set_best_mse,
                     "avg_full_oracle_mse": full_oracle_mse,
                     "avg_gain_support_vs_direct": direct_query_mse - support_top1_mse,
+                    "avg_gain_query_responsive_vs_direct": direct_query_mse - query_responsive_mse,
                     "avg_gain_set_vs_direct": direct_query_mse - set_best_mse,
+                    "avg_gap_query_responsive_to_full": query_responsive_mse - full_oracle_mse,
                     "avg_gap_set_to_full": set_best_mse - full_oracle_mse,
                 },
             )
@@ -247,6 +295,8 @@ def main() -> None:
         catalog=catalog,
         alpha=args.alpha,
         posterior_temperature=args.posterior_temperature,
+        obs_alpha=args.obs_alpha,
+        plan_core_alpha=args.plan_core_alpha,
         max_samples=args.max_samples,
         device=device,
     )
@@ -262,6 +312,8 @@ def main() -> None:
                 "split": args.split,
                 "candidate_source": args.candidate_source,
                 "posterior_temperature": args.posterior_temperature,
+                "obs_alpha": args.obs_alpha,
+                "plan_core_alpha": args.plan_core_alpha,
                 "summary": summary,
             },
             ensure_ascii=False,
@@ -278,6 +330,7 @@ def main() -> None:
         print(
             f"{mode}_direct={mode_summary['avg_direct_query_mse']:.6f} "
             f"{mode}_top1={mode_summary['avg_support_top1_mse']:.6f} "
+            f"{mode}_query_responsive={mode_summary['avg_query_responsive_mse']:.6f} "
             f"{mode}_set={mode_summary['avg_set_best_mse']:.6f} "
             f"{mode}_oracle={mode_summary['avg_full_oracle_mse']:.6f}"
         )

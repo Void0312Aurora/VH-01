@@ -10,6 +10,7 @@ import yaml
 @dataclass
 class DataConfig:
     kind: str = "synthetic"
+    synthetic_mode: str = "base"
     train_size: int = 4096
     val_size: int = 512
     seq_len: int = 8
@@ -33,6 +34,23 @@ class ModelConfig:
     identity_hidden_dim: int = 128
     semantic_num_classes: int = 0
     semantic_temperature: float = 0.2
+    chart_hidden_dim: int = 128
+    chart_num_experts: int = 1
+    chart_mode: str = "pointwise_residual"
+    chart_residual_scale: float = 0.1
+    chart_temporal_hidden_dim: int = 128
+    chart_temporal_kernel_size: int = 3
+    state_cov_proj_dim: int = 0
+    response_context_dim: int = 0
+    response_signature_mode: str = "span_stats"
+    tangent_dim: int = 0
+    local_measure_hidden_dim: int = 128
+    local_measure_rank: int = 8
+    local_measure_eps: float = 1e-4
+    local_diffusion_mode: str = "legacy"
+    local_diffusion_geometry_mode: str = "ambient"
+    local_diffusion_condition_mode: str = "joint"
+    measure_density_mode: str = "joint"
 
 
 @dataclass
@@ -51,6 +69,20 @@ class TrainConfig:
     stage3_epochs: int = 8
     identity_start_epoch: int = 0
     identity_warmup_epochs: int = 0
+    query_eval_enabled: bool = False
+    query_eval_alpha: float = 0.90
+    query_eval_obs_alpha: float = 0.90
+    query_eval_plan_core_alpha: float = 0.50
+    query_eval_posterior_temperature: float = 1.0
+    query_eval_max_samples: int = 80
+    checkpoint_selection_mode: str = "support"
+    query_checkpoint_fallback_budget: float = 0.05
+    query_checkpoint_exec_weight: float = 1.0
+    query_checkpoint_match_weight: float = 0.20
+    query_checkpoint_support_weight: float = 0.05
+    query_checkpoint_gap_weight: float = 0.25
+    measure_target_ema_decay: float = 0.0
+    measure_target_use_teacher_eval: bool = True
 
 
 @dataclass
@@ -82,6 +114,35 @@ class LossConfig:
     support_gate_p_true: float = 0.0
     support_gate_margin: float = 0.0
     support_gate_temperature: float = 0.05
+    local_drift_weight: float = 0.0
+    local_diffusion_weight: float = 0.0
+    measure_stationarity_weight: float = 0.0
+    response_smoothness_weight: float = 0.0
+    response_signature_knn: int = 4
+    response_signature_temperature: float = 0.5
+    response_geometry_knn: int = 8
+    response_geometry_temperature: float = 0.5
+    response_jet_ridge: float = 1e-3
+    response_jet_center_weight: float = 1.0
+    response_tau_ridge: float = 1e-3
+    response_tau_mean_penalty: float = 1.0
+    response_tau_drift_scale: float = 0.25
+    measure_density_temperature: float = 1.0
+    measure_test_num_directions: int = 8
+    measure_trig_scale: float = 1.0
+    measure_trace_weight: float = 0.0
+    tangent_projection_weight: float = 0.0
+    tangent_compatibility_weight: float = 0.0
+    tangent_spectrum_weight: float = 0.0
+    tangent_shape_weight: float = 0.0
+    diffusion_target_mode: str = "full"
+    measure_target_mode: str = "chart_moments"
+    measure_target_blend: float = 0.5
+    drift_target_mode: str = "bootstrap"
+    drift_target_blend: float = 0.5
+    measure_tilt_target_weight: float = 0.0
+    tilt_target_mode: str = "none"
+    tilt_target_blend: float = 0.5
 
 
 @dataclass

@@ -11,8 +11,14 @@ import torch
 
 from vh_mvp.config import load_config
 from vh_mvp.data import FolderVideoDataset, build_condition_catalog, condition_tuple_from_tensor
+from vh_mvp.losses import response_signature_dim
 from vh_mvp.models import VideoDynamicsMVP
-from vh_mvp.support import build_candidate_posterior, candidate_sets_from_posterior, condition_key
+from vh_mvp.support import (
+    build_candidate_posterior,
+    candidate_sets_from_posterior,
+    condition_key,
+    query_responsive_selection,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +32,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-source", type=str, default="both", choices=("train", "val", "both"))
     parser.add_argument("--alpha", type=float, default=0.90)
     parser.add_argument("--posterior-temperature", type=float, default=1.0)
+    parser.add_argument("--obs-alpha", type=float, default=0.90)
+    parser.add_argument("--plan-core-alpha", type=float, default=0.50)
     parser.add_argument("--max-samples", type=int, default=80)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=7)
@@ -59,6 +67,21 @@ def build_model_from_config(config_path: str, checkpoint_path: str, device: torc
         identity_hidden_dim=cfg.model.identity_hidden_dim,
         semantic_num_classes=cfg.model.semantic_num_classes,
         semantic_temperature=cfg.model.semantic_temperature,
+        chart_hidden_dim=cfg.model.chart_hidden_dim,
+        chart_num_experts=cfg.model.chart_num_experts,
+        chart_mode=cfg.model.chart_mode,
+        chart_residual_scale=cfg.model.chart_residual_scale,
+        chart_temporal_hidden_dim=cfg.model.chart_temporal_hidden_dim,
+        chart_temporal_kernel_size=cfg.model.chart_temporal_kernel_size,
+        state_cov_proj_dim=cfg.model.state_cov_proj_dim,
+        response_signature_dim=response_signature_dim(cfg.data.seq_len, cfg.model.response_signature_mode),
+        response_context_dim=cfg.model.response_context_dim,
+        local_measure_hidden_dim=cfg.model.local_measure_hidden_dim,
+        local_measure_rank=cfg.model.local_measure_rank,
+        local_measure_eps=cfg.model.local_measure_eps,
+        local_diffusion_mode=cfg.model.local_diffusion_mode,
+        local_diffusion_condition_mode=cfg.model.local_diffusion_condition_mode,
+        measure_density_mode=cfg.model.measure_density_mode,
     ).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=False)
@@ -132,6 +155,8 @@ def evaluate_selection_rules(
     catalog,
     alpha: float,
     posterior_temperature: float,
+    obs_alpha: float,
+    plan_core_alpha: float,
     max_samples: int,
     device: torch.device,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
@@ -145,6 +170,7 @@ def evaluate_selection_rules(
         "direct_query",
         "obs_top1",
         "plan_top1",
+        "query_responsive_top1",
         "obs_on_plan_set_top1",
         "joint_plan_set_top1",
         "joint_all_top1",
@@ -210,6 +236,13 @@ def evaluate_selection_rules(
             plan_members = plan_set.member_indices()[0]
             plan_log_probs = plan_posterior.probs[0].clamp_min(1e-12).log()
             plan_top1_idx = int(plan_posterior.top1_idx[0].item())
+            qr_selection = query_responsive_selection(
+                obs_posterior=obs_posterior,
+                plan_posterior=plan_posterior,
+                obs_alpha=obs_alpha,
+                plan_core_alpha=plan_core_alpha,
+            )
+            query_responsive_top1_idx = int(qr_selection.selected_idx[0].item())
 
             union_mask = obs_mask | plan_mask
             intersection_mask = obs_mask & plan_mask
@@ -239,6 +272,7 @@ def evaluate_selection_rules(
                 "direct_query": int(query_idx),
                 "obs_top1": obs_top1_idx,
                 "plan_top1": plan_top1_idx,
+                "query_responsive_top1": query_responsive_top1_idx,
                 "obs_on_plan_set_top1": obs_on_plan_set_top1_idx,
                 "joint_plan_set_top1": joint_plan_set_top1_idx,
                 "joint_all_top1": joint_all_top1_idx,
@@ -303,6 +337,8 @@ def main() -> None:
         catalog=catalog,
         alpha=args.alpha,
         posterior_temperature=args.posterior_temperature,
+        obs_alpha=args.obs_alpha,
+        plan_core_alpha=args.plan_core_alpha,
         max_samples=args.max_samples,
         device=device,
     )
@@ -318,6 +354,8 @@ def main() -> None:
                 "split": args.split,
                 "candidate_source": args.candidate_source,
                 "posterior_temperature": args.posterior_temperature,
+                "obs_alpha": args.obs_alpha,
+                "plan_core_alpha": args.plan_core_alpha,
                 "summary": summary,
             },
             ensure_ascii=False,
@@ -335,6 +373,7 @@ def main() -> None:
             f"{mode}_direct={mode_summary['direct_query_mse']:.6f} "
             f"{mode}_obs={mode_summary['obs_top1_mse']:.6f} "
             f"{mode}_plan={mode_summary['plan_top1_mse']:.6f} "
+            f"{mode}_query_responsive={mode_summary['query_responsive_top1_mse']:.6f} "
             f"{mode}_obs_plan_set={mode_summary['obs_on_plan_set_top1_mse']:.6f} "
             f"{mode}_joint_plan_set={mode_summary['joint_plan_set_top1_mse']:.6f} "
             f"{mode}_joint_union={mode_summary['joint_union_top1_mse']:.6f} "

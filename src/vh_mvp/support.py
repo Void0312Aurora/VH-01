@@ -51,6 +51,21 @@ class CandidateSet:
         return logits.masked_fill(~self.mask, float("-inf"))
 
 
+@dataclass
+class QueryResponsiveSelection:
+    selected_idx: torch.Tensor
+    exec_mask: torch.Tensor
+    obs_set: CandidateSet
+    plan_core: CandidateSet
+    used_plan_core_fallback: torch.Tensor
+
+    def member_indices(self) -> list[list[int]]:
+        members: list[list[int]] = []
+        for row in self.exec_mask:
+            members.append(torch.nonzero(row, as_tuple=False).squeeze(1).tolist())
+        return members
+
+
 def build_candidate_posterior(
     logits: torch.Tensor,
     temperature: float = 1.0,
@@ -104,6 +119,38 @@ def alpha_candidate_sets(
         }
         for alpha, candidate_set in sets.items()
     }
+
+
+def masked_argmax(scores: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    if scores.ndim != 2 or mask.ndim != 2:
+        raise ValueError("masked_argmax expects 2D scores and 2D mask tensors.")
+    if scores.shape != mask.shape:
+        raise ValueError(f"shape mismatch: scores={scores.shape}, mask={mask.shape}")
+    if not bool(mask.any(dim=1).all().item()):
+        raise ValueError("Each row must contain at least one valid candidate.")
+    return scores.masked_fill(~mask, float("-inf")).argmax(dim=1)
+
+
+def query_responsive_selection(
+    obs_posterior: CandidatePosterior,
+    plan_posterior: CandidatePosterior,
+    *,
+    obs_alpha: float = 0.90,
+    plan_core_alpha: float = 0.50,
+) -> QueryResponsiveSelection:
+    obs_set = candidate_sets_from_posterior(obs_posterior, [obs_alpha])[obs_alpha]
+    plan_core = candidate_sets_from_posterior(plan_posterior, [plan_core_alpha])[plan_core_alpha]
+    exec_mask = obs_set.mask & plan_core.mask
+    used_plan_core_fallback = ~exec_mask.any(dim=1)
+    exec_mask = torch.where(used_plan_core_fallback.unsqueeze(1), plan_core.mask, exec_mask)
+    selected_idx = masked_argmax(obs_posterior.probs, exec_mask)
+    return QueryResponsiveSelection(
+        selected_idx=selected_idx,
+        exec_mask=exec_mask,
+        obs_set=obs_set,
+        plan_core=plan_core,
+        used_plan_core_fallback=used_plan_core_fallback,
+    )
 
 
 def summarize_condition_distribution(

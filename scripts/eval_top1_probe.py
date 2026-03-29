@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from vh_mvp.config import load_config
 from vh_mvp.data import FolderVideoDataset
+from vh_mvp.losses import response_signature_dim
 from vh_mvp.models import VideoDynamicsMVP
 
 
@@ -62,6 +63,21 @@ def build_model_from_config(config_path: str, checkpoint_path: str, device: torc
         identity_hidden_dim=cfg.model.identity_hidden_dim,
         semantic_num_classes=cfg.model.semantic_num_classes,
         semantic_temperature=cfg.model.semantic_temperature,
+        chart_hidden_dim=cfg.model.chart_hidden_dim,
+        chart_num_experts=cfg.model.chart_num_experts,
+        chart_mode=cfg.model.chart_mode,
+        chart_residual_scale=cfg.model.chart_residual_scale,
+        chart_temporal_hidden_dim=cfg.model.chart_temporal_hidden_dim,
+        chart_temporal_kernel_size=cfg.model.chart_temporal_kernel_size,
+        state_cov_proj_dim=cfg.model.state_cov_proj_dim,
+        response_signature_dim=response_signature_dim(cfg.data.seq_len, cfg.model.response_signature_mode),
+        response_context_dim=cfg.model.response_context_dim,
+        local_measure_hidden_dim=cfg.model.local_measure_hidden_dim,
+        local_measure_rank=cfg.model.local_measure_rank,
+        local_measure_eps=cfg.model.local_measure_eps,
+        local_diffusion_mode=cfg.model.local_diffusion_mode,
+        local_diffusion_condition_mode=cfg.model.local_diffusion_condition_mode,
+        measure_density_mode=cfg.model.measure_density_mode,
     ).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=False)
