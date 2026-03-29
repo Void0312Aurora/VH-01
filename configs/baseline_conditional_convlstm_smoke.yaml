@@ -1,0 +1,28 @@
+seed: 7
+output_dir: runs/baseline_conditional_convlstm_smoke
+
+data:
+  kind: synthetic
+  train_size: 256
+  val_size: 64
+  seq_len: 8
+  image_size: 32
+  channels: 3
+  num_workers: 0
+
+train:
+  batch_size: 16
+  epochs: 2
+  lr: 0.0003
+  weight_decay: 0.00001
+  amp: false
+  gradient_clip_norm: 1.0
+  device: auto
+
+baseline:
+  cond_dim: 64
+  base_channels: 16
+  latent_channels: 32
+  hidden_channels: 32
+  recon_weight: 1.0
+  future_weight: 1.0

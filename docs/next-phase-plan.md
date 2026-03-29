@@ -204,7 +204,7 @@ $$
 
 基于上述顺序，接下来的直接动作应为：
 
-1. 继续把 `trajectory_state` 提升为更接近局部图坐标的连续表示；
+1. 巩固 `trajectory_point / trajectory_summary_context / response signature` 的对象分工，不再让 `trajectory_state` 混用局部基点与摘要语义；
 2. 沿着已经验证有效的 chart-target 路线继续推进，因为 synthetic 与 real bootstrap 都表明：坐标一致性比单纯 trace 修补更关键；
 3. 扩展弱形式测试函数与局部几何诊断，确认 `\mathcal L_c^* \mu_c = 0` 的近似恢复不只依赖低阶矩；
 4. 在“耦合 synthetic 非对角诊断”已经完成后，推进 `A_c` 的结构建模升级，解决“目标非对角已存在但预测非对角仍偏弱”的问题（`state_cov_proj_dim=8` 与 `response_signature` 上下文首轮尝试均未形成有效突破）；

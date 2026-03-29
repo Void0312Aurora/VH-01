@@ -1,0 +1,29 @@
+seed: 7
+output_dir: runs/baseline_conditional_convlstm_real_ucf101_subset
+
+data:
+  kind: folder
+  root: data/real/ucf101_subset_semantic
+  manifest_path: data/real/ucf101_subset_semantic/train.jsonl
+  val_manifest_path: data/real/ucf101_subset_semantic/val.jsonl
+  seq_len: 8
+  image_size: 32
+  channels: 3
+  num_workers: 4
+
+train:
+  batch_size: 8
+  epochs: 10
+  lr: 0.0003
+  weight_decay: 0.00001
+  amp: true
+  gradient_clip_norm: 1.0
+  device: auto
+
+baseline:
+  cond_dim: 64
+  base_channels: 32
+  latent_channels: 64
+  hidden_channels: 64
+  recon_weight: 1.0
+  future_weight: 1.0

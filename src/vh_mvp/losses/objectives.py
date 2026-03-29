@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 
@@ -48,33 +50,80 @@ def dynamics_loss(
     short_span_bias: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, steps, _ = latents.shape
-    decoded = model.decode_video(latents, cond_embed)
-    total = latents.new_tensor(0.0)
-    weight_sum = latents.new_tensor(0.0)
-    per_sample = latents.new_zeros(batch)
+    _, energy_triangle, mask, delta_reg = _compute_response_triangle_components(
+        model=model,
+        latents=latents,
+        video=video,
+        cond_embed=cond_embed,
+        include_residual_triangle=False,
+        include_delta_reg=True,
+    )
+    if steps < 2:
+        zero = latents.new_tensor(0.0)
+        return zero, latents.new_zeros(batch), zero
+
+    span_weights = latents.new_tensor(
+        [1.0 / ((span_idx + 1) ** short_span_bias) for span_idx in range(steps - 1)]
+    )
+    weight_triangle = mask.to(dtype=latents.dtype) * span_weights.view(-1, 1)
+    weight_sum = weight_triangle.sum().clamp_min(1e-6)
+    weighted_energy = energy_triangle * weight_triangle.unsqueeze(0)
+    per_sample = weighted_energy.sum(dim=(1, 2)) / weight_sum
+    total = per_sample.mean()
+    return total, per_sample, delta_reg
+
+
+def _compute_response_triangle_components(
+    model,
+    latents: torch.Tensor,
+    video: torch.Tensor,
+    cond_embed: torch.Tensor,
+    *,
+    decoded: torch.Tensor | None = None,
+    include_residual_triangle: bool,
+    include_delta_reg: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch, steps, *_ = video.shape
+    if decoded is None:
+        decoded = model.decode_video(latents, cond_embed)
+    frame_shape = video.shape[2:]
+    if steps < 2:
+        residual_triangle = latents.new_zeros(batch, 1, 1, *frame_shape) if include_residual_triangle else None
+        energy_triangle = latents.new_zeros(batch, 1, 1)
+        mask = torch.zeros(1, 1, dtype=torch.bool, device=latents.device)
+        delta_reg = latents.new_tensor(0.0)
+        return residual_triangle, energy_triangle, mask, delta_reg
+
+    span_count = steps - 1
+    residual_triangle = (
+        latents.new_zeros(batch, span_count, span_count, *frame_shape)
+        if include_residual_triangle
+        else None
+    )
+    energy_triangle = latents.new_zeros(batch, span_count, span_count)
+    mask = torch.zeros(span_count, span_count, dtype=torch.bool, device=latents.device)
     delta_reg = latents.new_tensor(0.0)
 
-    for i in range(steps - 1):
-        max_roll = steps - i - 1
-        rollout, deltas = model.rollout_from(latents[:, i], cond_embed, max_roll)
-        if deltas.numel() > 0:
+    for start in range(steps - 1):
+        max_roll = steps - start - 1
+        rollout, deltas = model.rollout_from(latents[:, start], cond_embed, max_roll)
+        if include_delta_reg and deltas.numel() > 0:
             delta_reg = delta_reg + (deltas**2).mean()
         for span in range(1, max_roll + 1):
-            j = i + span
-            weight = 1.0 / (span**short_span_bias)
+            end = start + span
             pred_frame = model.decode_video(rollout[:, span - 1 : span], cond_embed)[:, 0]
-            prev_frame = decoded[:, j - 1]
+            prev_frame = decoded[:, end - 1]
             pred_delta = pred_frame - prev_frame
-            true_delta = video[:, j] - video[:, j - 1]
-            residual = ((pred_delta - true_delta) ** 2).flatten(1).mean(dim=1)
-            total = total + weight * residual.mean()
-            weight_sum = weight_sum + weight
-            per_sample = per_sample + weight * residual
+            true_delta = video[:, end] - video[:, end - 1]
+            residual = pred_delta - true_delta
+            if residual_triangle is not None:
+                residual_triangle[:, span - 1, start] = residual
+            energy_triangle[:, span - 1, start] = residual.square().flatten(1).mean(dim=1)
+            mask[span - 1, start] = True
 
-    total = total / weight_sum.clamp_min(1e-6)
-    per_sample = per_sample / weight_sum.clamp_min(1e-6)
-    delta_reg = delta_reg / max(steps - 1, 1)
-    return total, per_sample, delta_reg
+    if include_delta_reg:
+        delta_reg = delta_reg / max(steps - 1, 1)
+    return residual_triangle, energy_triangle, mask, delta_reg
 
 
 def nce_condition_loss(logits: torch.Tensor, labels: torch.Tensor | None = None) -> torch.Tensor:
@@ -87,14 +136,18 @@ def support_refinement_loss(
     logits: torch.Tensor,
     labels: torch.Tensor,
     *,
+    posterior_temperature: float,
     p_true_floor: float,
+    p_true_ceiling: float,
     margin_floor: float,
+    margin_ceiling: float,
+    support_ratio_floor: float,
     support_ratio_ceiling: float,
     gate_p_true: float,
     gate_margin: float,
     gate_temperature: float,
 ) -> dict[str, torch.Tensor]:
-    probs = posterior_from_logits(logits)
+    probs = posterior_from_logits(logits, temperature=posterior_temperature)
     p_true = probs.gather(1, labels.unsqueeze(1)).squeeze(1)
 
     probs_wo_true = probs.clone()
@@ -106,8 +159,12 @@ def support_refinement_loss(
     support_ratio = torch.exp(entropy) / float(logits.size(1))
 
     zero = logits.new_tensor(0.0)
-    p_true_hinge = F.relu(p_true_floor - p_true).mean() if p_true_floor > 0.0 else zero
-    margin_hinge = F.relu(margin_floor - margin).mean() if margin_floor > 0.0 else zero
+    p_true_hinge = zero
+    if p_true_floor > 0.0:
+        p_true_hinge = p_true_hinge + F.relu(p_true_floor - p_true).mean()
+    margin_hinge = zero
+    if margin_floor > 0.0:
+        margin_hinge = margin_hinge + F.relu(margin_floor - margin).mean()
 
     gate_threshold_p = gate_p_true if gate_p_true > 0.0 else max(p_true_floor, 0.0)
     gate_threshold_m = gate_margin if gate_margin > 0.0 else max(margin_floor, 0.0)
@@ -116,9 +173,24 @@ def support_refinement_loss(
     if probs.size(1) > 1:
         confidence_gate = confidence_gate * torch.sigmoid((margin.detach() - gate_threshold_m) / gate_temperature)
 
+    if p_true_ceiling < 1.0:
+        p_true_hinge = p_true_hinge + (
+            confidence_gate * F.relu(p_true - p_true_ceiling)
+        ).mean()
+    if margin_ceiling < 1.0:
+        margin_hinge = margin_hinge + (
+            confidence_gate * F.relu(margin - margin_ceiling)
+        ).mean()
+
     support_ratio_hinge = zero
+    if support_ratio_floor > 0.0:
+        support_ratio_hinge = support_ratio_hinge + (
+            confidence_gate * F.relu(support_ratio_floor - support_ratio)
+        ).mean()
     if support_ratio_ceiling < 1.0:
-        support_ratio_hinge = (confidence_gate * F.relu(support_ratio - support_ratio_ceiling)).mean()
+        support_ratio_hinge = support_ratio_hinge + (
+            confidence_gate * F.relu(support_ratio - support_ratio_ceiling)
+        ).mean()
 
     return {
         "support_p_true_hinge": p_true_hinge,
@@ -128,15 +200,332 @@ def support_refinement_loss(
     }
 
 
+@dataclass
+class ResponseTriangleBundle:
+    residual_triangle: torch.Tensor
+    energy_triangle: torch.Tensor
+    mask: torch.Tensor
+
+
+@dataclass
+class GeometryNeighborhoodReference:
+    points: torch.Tensor | None
+    response_channels: torch.Tensor | None
+    tangent_frames: torch.Tensor | None
+    tangent_frame_valid: torch.Tensor | None
+
+    def size(self) -> int:
+        if self.points is None:
+            return 0
+        return int(self.points.size(0))
+
+
+@dataclass
+class SmoothnessNeighborhoodReference:
+    signatures: torch.Tensor | None
+    state: torch.Tensor | None
+    drift: torch.Tensor | None
+    diffusion_flat: torch.Tensor | None
+    log_density: torch.Tensor | None
+
+    def size(self) -> int:
+        if self.signatures is None:
+            return 0
+        return int(self.signatures.size(0))
+
+
+@dataclass
+class KNNNeighborhood:
+    knn_idx: torch.Tensor | None
+    weights: torch.Tensor | None
+    distances: torch.Tensor | None
+    reference_mask: torch.Tensor | None
+    candidate_count: int
+    reference_count: int
+
+
+@dataclass
+class ResponseInvariantTarget:
+    descriptor_triangle: torch.Tensor
+    signed_triangle: torch.Tensor
+    magnitude_triangle: torch.Tensor
+    mask: torch.Tensor
+    response_channels: torch.Tensor
+    operator: torch.Tensor
+    eigvals: torch.Tensor
+    trace: torch.Tensor
+    effective_rank: torch.Tensor
+    anisotropy: torch.Tensor
+    asymmetry: torch.Tensor
+    spectral_gap: torch.Tensor
+    scale_profile: torch.Tensor
+    tangent_frame: torch.Tensor | None
+    tangent_projector: torch.Tensor | None
+    tangent_drift: torch.Tensor | None
+    tangent_cov: torch.Tensor | None
+    identifiable_tangent_cov: torch.Tensor | None
+    support_tilt: torch.Tensor | None
+    graph_tau: torch.Tensor | None
+    neighbor_idx: torch.Tensor | None
+    neighbor_weights: torch.Tensor | None
+    transport: torch.Tensor | None
+    identifiable_effective_rank: torch.Tensor
+    identifiable_anisotropy: torch.Tensor
+    neighbor_pool_size: torch.Tensor
+    reference_pool_size: torch.Tensor
+    reference_neighbor_ratio: torch.Tensor
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+
+@dataclass
+class LocalGeneratorTarget:
+    signatures: torch.Tensor
+    source_point: torch.Tensor
+    source_summary_context: torch.Tensor
+    source_measure: object | None
+    invariant_target: ResponseInvariantTarget | None
+    drift_target: torch.Tensor
+    diffusion_target: torch.Tensor
+    full_diffusion_target: torch.Tensor
+    bootstrap_drift_target: torch.Tensor
+    bootstrap_diffusion_target: torch.Tensor
+    target_tangent_drift: torch.Tensor
+    target_tangent_cov: torch.Tensor | None
+    identifiable_tangent_cov: torch.Tensor | None
+    target_tangent_frame: torch.Tensor | None
+    target_tangent_projector: torch.Tensor | None
+    target_neighbor_idx: torch.Tensor | None
+    target_neighbor_weights: torch.Tensor | None
+    target_transport: torch.Tensor | None
+    response_identifiable_effective_rank: torch.Tensor
+    response_identifiable_anisotropy: torch.Tensor
+    tilt_target: torch.Tensor | None
+    response_operator_trace: torch.Tensor
+    response_operator_effective_rank: torch.Tensor
+    response_operator_anisotropy: torch.Tensor
+    response_operator_asymmetry: torch.Tensor
+    response_drift_alignment: torch.Tensor
+    geometry_neighbor_pool_size: torch.Tensor
+    geometry_reference_pool_size: torch.Tensor
+    geometry_reference_neighbor_ratio: torch.Tensor
+
+    def __getitem__(self, key: str):
+        return getattr(self, key)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "signatures": self.signatures,
+            "source_point": self.source_point,
+            "source_summary_context": self.source_summary_context,
+            "source_measure": self.source_measure,
+            "invariant_target": self.invariant_target,
+            "drift_target": self.drift_target,
+            "diffusion_target": self.diffusion_target,
+            "full_diffusion_target": self.full_diffusion_target,
+            "bootstrap_drift_target": self.bootstrap_drift_target,
+            "bootstrap_diffusion_target": self.bootstrap_diffusion_target,
+            "target_tangent_drift": self.target_tangent_drift,
+            "target_tangent_cov": self.target_tangent_cov,
+            "identifiable_tangent_cov": self.identifiable_tangent_cov,
+            "target_tangent_frame": self.target_tangent_frame,
+            "target_tangent_projector": self.target_tangent_projector,
+            "target_neighbor_idx": self.target_neighbor_idx,
+            "target_neighbor_weights": self.target_neighbor_weights,
+            "target_transport": self.target_transport,
+            "response_identifiable_effective_rank": self.response_identifiable_effective_rank,
+            "response_identifiable_anisotropy": self.response_identifiable_anisotropy,
+            "tilt_target": self.tilt_target,
+            "response_operator_trace": self.response_operator_trace,
+            "response_operator_effective_rank": self.response_operator_effective_rank,
+            "response_operator_anisotropy": self.response_operator_anisotropy,
+            "response_operator_asymmetry": self.response_operator_asymmetry,
+            "response_drift_alignment": self.response_drift_alignment,
+            "geometry_neighbor_pool_size": self.geometry_neighbor_pool_size,
+            "geometry_reference_pool_size": self.geometry_reference_pool_size,
+            "geometry_reference_neighbor_ratio": self.geometry_reference_neighbor_ratio,
+        }
+
+
+DEFAULT_RESPONSE_DESCRIPTOR_SPATIAL_SIZE = 4
+DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_ABS = True
+DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_SQUARE = True
+
+
+def _truncate_reference_tensor(tensor: torch.Tensor | None, max_size: int) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if max_size <= 0 or tensor.size(0) <= max_size:
+        return tensor
+    return tensor[-max_size:]
+
+
+def _concat_reference_tensors(
+    current: torch.Tensor | None,
+    update: torch.Tensor | None,
+    *,
+    max_size: int,
+) -> torch.Tensor | None:
+    if current is None:
+        return _truncate_reference_tensor(update, max_size)
+    if update is None:
+        return _truncate_reference_tensor(current, max_size)
+    merged = torch.cat([current, update], dim=0)
+    return _truncate_reference_tensor(merged, max_size)
+
+
 @torch.no_grad()
-def response_signature_dim(seq_len: int, mode: str = "span_stats") -> int:
+def append_geometry_neighborhood_reference(
+    reference: GeometryNeighborhoodReference | None,
+    update: GeometryNeighborhoodReference | None,
+    *,
+    max_size: int,
+) -> GeometryNeighborhoodReference | None:
+    if max_size <= 0 or update is None or update.size() <= 0:
+        return reference if max_size > 0 else None
+    if reference is None:
+        return GeometryNeighborhoodReference(
+            points=_truncate_reference_tensor(update.points, max_size),
+            response_channels=_truncate_reference_tensor(update.response_channels, max_size),
+            tangent_frames=_truncate_reference_tensor(update.tangent_frames, max_size),
+            tangent_frame_valid=_truncate_reference_tensor(update.tangent_frame_valid, max_size),
+        )
+    return GeometryNeighborhoodReference(
+        points=_concat_reference_tensors(reference.points, update.points, max_size=max_size),
+        response_channels=_concat_reference_tensors(
+            reference.response_channels,
+            update.response_channels,
+            max_size=max_size,
+        ),
+        tangent_frames=_concat_reference_tensors(
+            reference.tangent_frames,
+            update.tangent_frames,
+            max_size=max_size,
+        ),
+        tangent_frame_valid=_concat_reference_tensors(
+            reference.tangent_frame_valid,
+            update.tangent_frame_valid,
+            max_size=max_size,
+        ),
+    )
+
+
+@torch.no_grad()
+def append_smoothness_neighborhood_reference(
+    reference: SmoothnessNeighborhoodReference | None,
+    update: SmoothnessNeighborhoodReference | None,
+    *,
+    max_size: int,
+) -> SmoothnessNeighborhoodReference | None:
+    if max_size <= 0 or update is None or update.size() <= 0:
+        return reference if max_size > 0 else None
+    if reference is None:
+        return SmoothnessNeighborhoodReference(
+            signatures=_truncate_reference_tensor(update.signatures, max_size),
+            state=_truncate_reference_tensor(update.state, max_size),
+            drift=_truncate_reference_tensor(update.drift, max_size),
+            diffusion_flat=_truncate_reference_tensor(update.diffusion_flat, max_size),
+            log_density=_truncate_reference_tensor(update.log_density, max_size),
+        )
+    return SmoothnessNeighborhoodReference(
+        signatures=_concat_reference_tensors(reference.signatures, update.signatures, max_size=max_size),
+        state=_concat_reference_tensors(reference.state, update.state, max_size=max_size),
+        drift=_concat_reference_tensors(reference.drift, update.drift, max_size=max_size),
+        diffusion_flat=_concat_reference_tensors(
+            reference.diffusion_flat,
+            update.diffusion_flat,
+            max_size=max_size,
+        ),
+        log_density=_concat_reference_tensors(reference.log_density, update.log_density, max_size=max_size),
+    )
+
+
+@torch.no_grad()
+def response_descriptor_dim(
+    channels: int,
+    *,
+    spatial_size: int = DEFAULT_RESPONSE_DESCRIPTOR_SPATIAL_SIZE,
+    include_abs: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_ABS,
+    include_square: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_SQUARE,
+) -> int:
+    component_count = 1 + int(include_abs) + int(include_square)
+    return max(channels * spatial_size * spatial_size * component_count, 1)
+
+
+@torch.no_grad()
+def response_signature_dim(
+    seq_len: int,
+    mode: str = "span_stats",
+    *,
+    channels: int | None = None,
+    spatial_size: int = DEFAULT_RESPONSE_DESCRIPTOR_SPATIAL_SIZE,
+    include_abs: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_ABS,
+    include_square: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_SQUARE,
+) -> int:
     if seq_len < 2:
-        return 1
+        if mode in {"span_stats", "full_triangle"}:
+            return 1
+        if channels is None:
+            raise ValueError(f"channels must be provided for response_signature mode: {mode}")
+        descriptor_width = response_descriptor_dim(
+            channels,
+            spatial_size=spatial_size,
+            include_abs=include_abs,
+            include_square=include_square,
+        )
+        if mode == "descriptor_span_stats":
+            return 2 * descriptor_width
+        if mode == "descriptor_full_triangle":
+            return descriptor_width
+        raise ValueError(f"Unsupported response_signature mode: {mode}")
     if mode == "span_stats":
         return max(2 * (seq_len - 1), 2)
     if mode == "full_triangle":
         return max(seq_len * (seq_len - 1) // 2, 1)
+    if mode in {"descriptor_span_stats", "descriptor_full_triangle"}:
+        if channels is None:
+            raise ValueError(f"channels must be provided for response_signature mode: {mode}")
+        descriptor_width = response_descriptor_dim(
+            channels,
+            spatial_size=spatial_size,
+            include_abs=include_abs,
+            include_square=include_square,
+        )
+        if mode == "descriptor_span_stats":
+            return max(2 * (seq_len - 1) * descriptor_width, 2 * descriptor_width)
+        return max((seq_len * (seq_len - 1) // 2) * descriptor_width, descriptor_width)
     raise ValueError(f"Unsupported response_signature mode: {mode}")
+
+
+@torch.no_grad()
+def response_triangle_bundle(
+    model,
+    latents: torch.Tensor,
+    video: torch.Tensor,
+    cond_embed: torch.Tensor,
+    decoded: torch.Tensor | None = None,
+) -> ResponseTriangleBundle:
+    residual_triangle, energy_triangle, mask, _ = _compute_response_triangle_components(
+        model=model,
+        latents=latents,
+        video=video,
+        cond_embed=cond_embed,
+        decoded=decoded,
+        include_residual_triangle=True,
+        include_delta_reg=False,
+    )
+    return ResponseTriangleBundle(
+        residual_triangle=residual_triangle,
+        energy_triangle=energy_triangle,
+        mask=mask,
+    )
 
 
 @torch.no_grad()
@@ -147,45 +536,96 @@ def response_triangle(
     cond_embed: torch.Tensor,
     decoded: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    batch, steps, *_ = video.shape
-    if steps < 2:
-        triangle = latents.new_zeros(batch, 1, 1)
-        mask = torch.zeros(1, 1, dtype=torch.bool, device=latents.device)
-        return triangle, mask
-
-    if decoded is None:
-        decoded = model.decode_video(latents, cond_embed)
-
-    span_count = steps - 1
-    triangle = latents.new_zeros(batch, span_count, span_count)
-    mask = torch.zeros(span_count, span_count, dtype=torch.bool, device=latents.device)
-    for span in range(1, steps):
-        span_residuals: list[torch.Tensor] = []
-        for start in range(steps - span):
-            rollout, _ = model.rollout_from(latents[:, start], cond_embed, span)
-            pred_frame = model.decode_video(rollout[:, span - 1 : span], cond_embed)[:, 0]
-            prev_frame = decoded[:, start + span - 1]
-            pred_delta = pred_frame - prev_frame
-            true_delta = video[:, start + span] - video[:, start + span - 1]
-            residual = ((pred_delta - true_delta) ** 2).flatten(1).mean(dim=1)
-            span_residuals.append(residual)
-        span_tensor = torch.stack(span_residuals, dim=1)
-        triangle[:, span - 1, : span_tensor.size(1)] = span_tensor
-        mask[span - 1, : span_tensor.size(1)] = True
-    return triangle, mask
+    bundle = response_triangle_bundle(
+        model=model,
+        latents=latents,
+        video=video,
+        cond_embed=cond_embed,
+        decoded=decoded,
+    )
+    return bundle.energy_triangle, bundle.mask
 
 
 @torch.no_grad()
-def _response_signature_from_triangle(
-    triangle: torch.Tensor,
+def response_descriptor_triangle_from_bundle(
+    bundle: ResponseTriangleBundle,
+    *,
+    spatial_size: int = DEFAULT_RESPONSE_DESCRIPTOR_SPATIAL_SIZE,
+    include_abs: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_ABS,
+    include_square: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_SQUARE,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_triangle = bundle.residual_triangle
+    mask = bundle.mask
+    batch, span_count, max_start, channels, _, _ = residual_triangle.shape
+    output_size = (spatial_size, spatial_size)
+    component_count = 1 + int(include_abs) + int(include_square)
+    descriptor_dim = channels * spatial_size * spatial_size * component_count
+    descriptor_triangle = residual_triangle.new_zeros(batch, span_count, max_start, descriptor_dim)
+    signed_triangle = residual_triangle.new_zeros(batch, span_count, max_start)
+    magnitude_triangle = residual_triangle.new_zeros(batch, span_count, max_start)
+
+    for span_idx in range(span_count):
+        valid_count = int(mask[span_idx].sum().item())
+        if valid_count <= 0:
+            continue
+        span_residual = residual_triangle[:, span_idx, :valid_count]
+        flat_residual = span_residual.reshape(batch * valid_count, channels, *span_residual.shape[-2:])
+        signed_pool = F.adaptive_avg_pool2d(flat_residual, output_size).flatten(1)
+        components = [signed_pool]
+        if include_abs:
+            components.append(F.adaptive_avg_pool2d(flat_residual.abs(), output_size).flatten(1))
+        if include_square:
+            components.append(F.adaptive_avg_pool2d(flat_residual.square(), output_size).flatten(1))
+        descriptor = torch.cat(components, dim=1).view(batch, valid_count, -1)
+        descriptor_triangle[:, span_idx, :valid_count] = descriptor
+        signed_triangle[:, span_idx, :valid_count] = signed_pool.mean(dim=1).view(batch, valid_count)
+        magnitude_triangle[:, span_idx, :valid_count] = descriptor.norm(dim=-1)
+
+    return descriptor_triangle, signed_triangle, magnitude_triangle
+
+
+@torch.no_grad()
+def response_descriptor_from_bundle(
+    bundle: ResponseTriangleBundle,
+    *,
+    spatial_size: int = DEFAULT_RESPONSE_DESCRIPTOR_SPATIAL_SIZE,
+    include_abs: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_ABS,
+    include_square: bool = DEFAULT_RESPONSE_DESCRIPTOR_INCLUDE_SQUARE,
+) -> torch.Tensor:
+    descriptor_triangle, _, _ = response_descriptor_triangle_from_bundle(
+        bundle,
+        spatial_size=spatial_size,
+        include_abs=include_abs,
+        include_square=include_square,
+    )
+    batch = descriptor_triangle.size(0)
+    pooled_channels: list[torch.Tensor] = []
+    for span_idx in range(descriptor_triangle.size(1)):
+        valid_count = int(bundle.mask[span_idx].sum().item())
+        if valid_count <= 0:
+            continue
+        pooled_channels.append(descriptor_triangle[:, span_idx, :valid_count].reshape(batch, -1))
+    if not pooled_channels:
+        return descriptor_triangle.new_zeros(batch, 1)
+    return torch.cat(pooled_channels, dim=1)
+
+
+@torch.no_grad()
+def _response_signature_from_descriptor_triangle(
+    descriptor_triangle: torch.Tensor,
+    signed_triangle: torch.Tensor,
     mask: torch.Tensor,
     mode: str,
 ) -> torch.Tensor:
-    batch, span_count, _ = triangle.shape
+    batch, span_count, _, descriptor_width = descriptor_triangle.shape
     if span_count < 1:
-        return triangle.new_zeros(batch, 1)
+        if mode == "descriptor_span_stats":
+            return descriptor_triangle.new_zeros(batch, 2 * descriptor_width)
+        if mode == "descriptor_full_triangle":
+            return descriptor_triangle.new_zeros(batch, descriptor_width)
+        return signed_triangle.new_zeros(batch, 1)
 
-    if mode not in {"span_stats", "full_triangle"}:
+    if mode not in {"span_stats", "full_triangle", "descriptor_span_stats", "descriptor_full_triangle"}:
         raise ValueError(f"Unsupported response_signature mode: {mode}")
 
     components: list[torch.Tensor] = []
@@ -193,8 +633,17 @@ def _response_signature_from_triangle(
         valid_count = int(mask[span_idx].sum().item())
         if valid_count <= 0:
             continue
-        span_tensor = triangle[:, span_idx, :valid_count]
-        if mode == "full_triangle":
+        span_descriptor = descriptor_triangle[:, span_idx, :valid_count]
+        span_tensor = signed_triangle[:, span_idx, :valid_count]
+        if mode == "descriptor_full_triangle":
+            components.append(span_descriptor.reshape(batch, valid_count * descriptor_width))
+        elif mode == "descriptor_span_stats":
+            components.append(span_descriptor.mean(dim=1))
+            if valid_count > 1:
+                components.append(span_descriptor.std(dim=1, unbiased=False))
+            else:
+                components.append(torch.zeros_like(span_descriptor[:, 0]))
+        elif mode == "full_triangle":
             components.append(span_tensor)
         else:
             components.append(span_tensor.mean(dim=1, keepdim=True))
@@ -203,26 +652,45 @@ def _response_signature_from_triangle(
             else:
                 components.append(torch.zeros_like(span_tensor[:, :1]))
     if not components:
-        return triangle.new_zeros(batch, response_signature_dim(span_count + 1, mode))
+        if mode == "descriptor_span_stats":
+            return descriptor_triangle.new_zeros(batch, max(2 * span_count * descriptor_width, 2 * descriptor_width))
+        if mode == "descriptor_full_triangle":
+            return descriptor_triangle.new_zeros(batch, descriptor_width)
+        return signed_triangle.new_zeros(batch, response_signature_dim(span_count + 1, mode))
     return torch.cat(components, dim=1)
 
 
 @torch.no_grad()
-def _response_operator_from_triangle(
-    triangle: torch.Tensor,
+def _response_operator_from_descriptor_triangle(
+    descriptor_triangle: torch.Tensor,
+    magnitude_triangle: torch.Tensor,
     mask: torch.Tensor,
     *,
+    signed_triangle: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> dict[str, torch.Tensor]:
-    mask_f = mask.to(dtype=triangle.dtype).unsqueeze(0)
-    valid_counts = mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
-    row_mean = (triangle * mask_f).sum(dim=-1, keepdim=True) / valid_counts
-    centered = (triangle - row_mean) * mask_f
+    batch, span_count, max_start, descriptor_dim = descriptor_triangle.shape
+    row_dim = max_start * descriptor_dim
+    row_vectors = descriptor_triangle.new_zeros(batch, span_count, row_dim)
+    row_mask = torch.zeros(span_count, row_dim, dtype=descriptor_triangle.dtype, device=descriptor_triangle.device)
+
+    for span_idx in range(span_count):
+        valid_count = int(mask[span_idx].sum().item())
+        if valid_count <= 0:
+            continue
+        width = valid_count * descriptor_dim
+        row_vectors[:, span_idx, :width] = descriptor_triangle[:, span_idx, :valid_count].reshape(batch, width)
+        row_mask[span_idx, :width] = 1.0
+
+    row_mask_f = row_mask.unsqueeze(0)
+    valid_counts = row_mask_f.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    row_mean = (row_vectors * row_mask_f).sum(dim=-1, keepdim=True) / valid_counts
+    centered = (row_vectors - row_mean) * row_mask_f
     row_scale = centered.square().sum(dim=-1, keepdim=True).div(valid_counts).sqrt().clamp_min(eps)
     normalized = centered / row_scale
-    normalized = normalized * mask_f
+    normalized = normalized * row_mask_f
     operator = normalized @ normalized.transpose(-1, -2)
-    normalizer = mask_f.sum(dim=-1).amax(dim=-1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
+    normalizer = row_mask_f.sum(dim=-1).amax(dim=-1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
     operator = operator / normalizer
     operator = 0.5 * (operator + operator.transpose(-1, -2))
     eigvals = _sorted_eigvalsh(operator).clamp_min(0.0)
@@ -231,9 +699,11 @@ def _response_operator_from_triangle(
     entropy = -(spectral_mass * spectral_mass.clamp_min(eps).log()).sum(dim=-1)
     effective_rank = torch.exp(entropy)
     anisotropy = torch.log(eigvals.clamp_min(eps)).std(dim=-1, unbiased=False)
-    start_positions = torch.linspace(-1.0, 1.0, triangle.size(-1), device=triangle.device, dtype=triangle.dtype)
-    asymmetry_num = (triangle * mask_f * start_positions.view(1, 1, -1)).sum(dim=(-1, -2))
-    asymmetry_den = (triangle.abs() * mask_f).sum(dim=(-1, -2)).clamp_min(eps)
+    start_positions = torch.linspace(-1.0, 1.0, max_start, device=descriptor_triangle.device, dtype=descriptor_triangle.dtype)
+    asymmetry_source = signed_triangle if signed_triangle is not None else magnitude_triangle
+    mask_f = mask.to(dtype=descriptor_triangle.dtype).unsqueeze(0)
+    asymmetry_num = (asymmetry_source * mask_f * start_positions.view(1, 1, -1)).sum(dim=(-1, -2))
+    asymmetry_den = (asymmetry_source.abs() * mask_f).sum(dim=(-1, -2)).clamp_min(eps)
     asymmetry = asymmetry_num / asymmetry_den
     return {
         "operator": operator,
@@ -246,20 +716,222 @@ def _response_operator_from_triangle(
 
 
 @torch.no_grad()
-def _flatten_response_channels(
-    triangle: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    batch = triangle.size(0)
-    channels: list[torch.Tensor] = []
-    for span_idx in range(triangle.size(1)):
-        valid_count = int(mask[span_idx].sum().item())
+def build_response_invariant_target(
+    source_point: torch.Tensor,
+    response_bundle: ResponseTriangleBundle,
+    *,
+    tangent_dim: int,
+    geometry_knn: int,
+    geometry_temperature: float,
+    jet_ridge: float,
+    jet_center_weight: float,
+    base_log_density_target: torch.Tensor | None = None,
+    tilt_target_mode: str = "none",
+    tau_ridge: float = 1e-3,
+    tau_mean_penalty: float = 1.0,
+    tau_drift_scale: float = 0.25,
+    geometry_reference: GeometryNeighborhoodReference | None = None,
+) -> ResponseInvariantTarget:
+    descriptor_triangle, signed_triangle, magnitude_triangle = response_descriptor_triangle_from_bundle(response_bundle)
+    descriptor_rows: list[torch.Tensor] = []
+    scale_rows: list[torch.Tensor] = []
+    for span_idx in range(descriptor_triangle.size(1)):
+        valid_count = int(response_bundle.mask[span_idx].sum().item())
         if valid_count <= 0:
             continue
-        channels.append(triangle[:, span_idx, :valid_count])
-    if not channels:
-        return triangle.new_zeros(batch, 1)
-    return torch.cat(channels, dim=1)
+        descriptor_rows.append(descriptor_triangle[:, span_idx, :valid_count].reshape(descriptor_triangle.size(0), -1))
+        span_scale = magnitude_triangle[:, span_idx, :valid_count].mean(dim=1, keepdim=True)
+        scale_rows.append(span_scale)
+    response_channels = (
+        torch.cat(descriptor_rows, dim=1)
+        if descriptor_rows
+        else descriptor_triangle.new_zeros(descriptor_triangle.size(0), 1)
+    )
+    scale_profile = (
+        torch.cat(scale_rows, dim=1)
+        if scale_rows
+        else descriptor_triangle.new_zeros(descriptor_triangle.size(0), 1)
+    )
+    scale_profile = scale_profile / scale_profile.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    response_operator = _response_operator_from_descriptor_triangle(
+        descriptor_triangle,
+        magnitude_triangle,
+        response_bundle.mask,
+        signed_triangle=signed_triangle,
+    )
+    eigvals = response_operator["eigvals"]
+    if eigvals.size(1) > 1:
+        spectral_gap = (eigvals[:, 0] - eigvals[:, 1]) / response_operator["trace"].clamp_min(1e-6)
+    else:
+        spectral_gap = eigvals[:, 0] / response_operator["trace"].clamp_min(1e-6)
+
+    response_jet = _local_response_jet_bundle(
+        source_point,
+        response_channels,
+        tangent_dim=tangent_dim,
+        knn=geometry_knn,
+        temperature=geometry_temperature,
+        ridge=jet_ridge,
+        center_weight=jet_center_weight,
+        reference_states=None if geometry_reference is None else geometry_reference.points,
+        reference_response_channels=None if geometry_reference is None else geometry_reference.response_channels,
+        reference_tangent_frames=None if geometry_reference is None else geometry_reference.tangent_frames,
+        reference_tangent_frame_valid=None if geometry_reference is None else geometry_reference.tangent_frame_valid,
+    )
+
+    support_tilt = torch.log(response_operator["trace"].clamp_min(1e-6)).unsqueeze(-1)
+    support_tilt = support_tilt + 0.25 * response_operator["anisotropy"].unsqueeze(-1)
+    support_tilt = support_tilt + 0.25 * response_operator["asymmetry"].abs().unsqueeze(-1)
+    support_tilt = (support_tilt - support_tilt.mean(dim=0, keepdim=True)) / support_tilt.std(
+        dim=0,
+        unbiased=False,
+        keepdim=True,
+    ).clamp_min(1e-6)
+    if response_jet["support_tilt"] is not None:
+        support_tilt = response_jet["support_tilt"]
+
+    graph_tau_target = None
+    if tilt_target_mode == "graph_tau" and base_log_density_target is not None and response_jet["frame"] is not None:
+        graph_tau_bundle = _solve_graph_tau_target(
+            source_point,
+            base_log_density_target,
+            jet_bundle=response_jet,
+            temperature=geometry_temperature,
+            ridge=tau_ridge,
+            mean_penalty=tau_mean_penalty,
+            drift_scale=tau_drift_scale,
+        )
+        graph_tau_target = graph_tau_bundle["tau"]
+
+    return ResponseInvariantTarget(
+        descriptor_triangle=descriptor_triangle,
+        signed_triangle=signed_triangle,
+        magnitude_triangle=magnitude_triangle,
+        mask=response_bundle.mask,
+        response_channels=response_channels,
+        operator=response_operator["operator"],
+        eigvals=eigvals,
+        trace=response_operator["trace"],
+        effective_rank=response_operator["effective_rank"],
+        anisotropy=response_operator["anisotropy"],
+        asymmetry=response_operator["asymmetry"],
+        spectral_gap=spectral_gap,
+        scale_profile=scale_profile,
+        tangent_frame=response_jet["frame"],
+        tangent_projector=response_jet["projector"],
+        tangent_drift=response_jet["tangent_drift"],
+        tangent_cov=response_jet["tangent_cov"],
+        identifiable_tangent_cov=response_jet["identifiable_tangent_cov"],
+        support_tilt=support_tilt,
+        graph_tau=graph_tau_target,
+        neighbor_idx=response_jet["neighbor_idx"],
+        neighbor_weights=response_jet["neighbor_weights"],
+        transport=response_jet["transport"],
+        identifiable_effective_rank=response_jet["effective_rank"],
+        identifiable_anisotropy=response_jet["anisotropy"],
+        neighbor_pool_size=response_jet["neighbor_pool_size"],
+        reference_pool_size=response_jet["reference_pool_size"],
+        reference_neighbor_ratio=response_jet["reference_neighbor_ratio"],
+    )
+
+
+@torch.no_grad()
+def build_geometry_neighborhood_reference(
+    model,
+    latents: torch.Tensor,
+    video: torch.Tensor,
+    cond_embed: torch.Tensor,
+    *,
+    decoded: torch.Tensor | None = None,
+    geometry_knn: int = 3,
+    geometry_temperature: float = 0.5,
+    jet_ridge: float = 1e-3,
+    jet_center_weight: float = 1.0,
+) -> GeometryNeighborhoodReference:
+    if latents.size(0) == 0:
+        return GeometryNeighborhoodReference(
+            points=None,
+            response_channels=None,
+            tangent_frames=None,
+            tangent_frame_valid=None,
+        )
+    point = model.trajectory_point(latents).detach()
+    bundle = response_triangle_bundle(
+        model=model,
+        latents=latents,
+        video=video,
+        cond_embed=cond_embed,
+        decoded=decoded,
+    )
+    response_channels = response_descriptor_from_bundle(bundle).detach()
+    tangent_frames = None
+    tangent_frame_valid = None
+    tangent_dim = int(getattr(model, "tangent_dim", 0))
+    if tangent_dim > 0:
+        tangent_frames = point.new_zeros(point.size(0), point.size(1), tangent_dim)
+        tangent_frame_valid = torch.zeros(point.size(0), device=point.device, dtype=torch.bool)
+        response_jet = _local_response_jet_bundle(
+            point,
+            response_channels,
+            tangent_dim=tangent_dim,
+            knn=geometry_knn,
+            temperature=geometry_temperature,
+            ridge=jet_ridge,
+            center_weight=jet_center_weight,
+        )
+        jet_frame = response_jet["frame"]
+        if jet_frame is not None:
+            tangent_frames = jet_frame.detach()
+            tangent_frame_valid = torch.ones(point.size(0), device=point.device, dtype=torch.bool)
+    return GeometryNeighborhoodReference(
+        points=point,
+        response_channels=response_channels,
+        tangent_frames=tangent_frames,
+        tangent_frame_valid=tangent_frame_valid,
+    )
+
+
+@torch.no_grad()
+def build_smoothness_neighborhood_reference(
+    model,
+    latents: torch.Tensor,
+    video: torch.Tensor,
+    cond_embed: torch.Tensor,
+    *,
+    signature_mode: str,
+    decoded: torch.Tensor | None = None,
+) -> SmoothnessNeighborhoodReference:
+    if latents.size(0) == 0:
+        return SmoothnessNeighborhoodReference(
+            signatures=None,
+            state=None,
+            drift=None,
+            diffusion_flat=None,
+            log_density=None,
+        )
+    state = model.trajectory_point(latents)
+    signatures = response_signature(
+        model=model,
+        latents=latents,
+        video=video,
+        cond_embed=cond_embed,
+        decoded=decoded,
+        mode=signature_mode,
+    )
+    generator = model.local_generator(
+        latents,
+        cond_embed,
+        response_context=signatures,
+        state=state,
+    )
+    return SmoothnessNeighborhoodReference(
+        signatures=signatures.detach(),
+        state=state.detach(),
+        drift=generator.drift.detach(),
+        diffusion_flat=generator.diffusion_matrix.detach().flatten(1),
+        log_density=generator.conditional_measure.log_total_density.detach().squeeze(-1),
+    )
 
 
 @torch.no_grad()
@@ -268,18 +940,44 @@ def _build_knn_graph(
     *,
     knn: int,
     temperature: float,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    reference_points: torch.Tensor | None = None,
+) -> KNNNeighborhood:
     batch = points.size(0)
-    if batch < 2 or knn <= 0:
-        return None, None, None
-    num_neighbors = min(knn, batch - 1)
-    distance = torch.cdist(points.detach(), points.detach(), p=2.0)
-    inf = torch.full_like(distance.diagonal(), float("inf"))
+    reference_count = 0 if reference_points is None else int(reference_points.size(0))
+    candidate_count = batch + reference_count
+    if candidate_count < 2 or knn <= 0:
+        return KNNNeighborhood(
+            knn_idx=None,
+            weights=None,
+            distances=None,
+            reference_mask=None,
+            candidate_count=candidate_count,
+            reference_count=reference_count,
+        )
+    num_neighbors = min(knn, candidate_count - 1)
+    candidate_points = points.detach()
+    if reference_points is not None and reference_points.numel() > 0:
+        candidate_points = torch.cat(
+            [
+                candidate_points,
+                reference_points.detach().to(device=points.device, dtype=points.dtype),
+            ],
+            dim=0,
+        )
+    distance = torch.cdist(points.detach(), candidate_points, p=2.0)
+    inf = torch.full((batch,), float("inf"), device=distance.device, dtype=distance.dtype)
     distance = distance.clone()
-    distance.diagonal().copy_(inf)
+    distance[torch.arange(batch, device=distance.device), torch.arange(batch, device=distance.device)] = inf
     knn_dist, knn_idx = torch.topk(distance, k=num_neighbors, largest=False, dim=1)
     weights = torch.softmax(-knn_dist / max(temperature, 1e-4), dim=1)
-    return knn_idx, weights, knn_dist
+    return KNNNeighborhood(
+        knn_idx=knn_idx,
+        weights=weights,
+        distances=knn_dist,
+        reference_mask=knn_idx >= batch,
+        candidate_count=candidate_count,
+        reference_count=reference_count,
+    )
 
 
 def _quadratic_feature_dim(dim: int) -> int:
@@ -321,6 +1019,10 @@ def _local_response_jet_bundle(
     temperature: float,
     ridge: float,
     center_weight: float,
+    reference_states: torch.Tensor | None = None,
+    reference_response_channels: torch.Tensor | None = None,
+    reference_tangent_frames: torch.Tensor | None = None,
+    reference_tangent_frame_valid: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor | None]:
     if response_channels.dim() > 2:
         response_channels = response_channels.reshape(response_channels.size(0), -1)
@@ -329,7 +1031,10 @@ def _local_response_jet_bundle(
 
     batch, state_dim = states.shape
     zero_scalar = states.new_tensor(0.0)
-    if batch < 2 or tangent_dim <= 0:
+    reference_count = 0 if reference_states is None else int(reference_states.size(0))
+    neighbor_pool_size = states.new_tensor(float(batch + reference_count))
+    reference_pool_size = states.new_tensor(float(reference_count))
+    if batch < 1 or batch + reference_count < 2 or tangent_dim <= 0:
         return {
             "frame": None,
             "projector": None,
@@ -342,9 +1047,19 @@ def _local_response_jet_bundle(
             "support_tilt": None,
             "effective_rank": zero_scalar,
             "anisotropy": zero_scalar,
+            "neighbor_pool_size": neighbor_pool_size,
+            "reference_pool_size": reference_pool_size,
+            "reference_neighbor_ratio": zero_scalar,
         }
 
-    knn_idx, knn_weights, _ = _build_knn_graph(states, knn=knn, temperature=temperature)
+    neighborhood = _build_knn_graph(
+        states,
+        knn=knn,
+        temperature=temperature,
+        reference_points=reference_states,
+    )
+    knn_idx = neighborhood.knn_idx
+    knn_weights = neighborhood.weights
     if knn_idx is None or knn_weights is None:
         return {
             "frame": None,
@@ -358,11 +1073,23 @@ def _local_response_jet_bundle(
             "support_tilt": None,
             "effective_rank": zero_scalar,
             "anisotropy": zero_scalar,
+            "neighbor_pool_size": neighbor_pool_size,
+            "reference_pool_size": reference_pool_size,
+            "reference_neighbor_ratio": zero_scalar,
         }
 
     tangent_dim = min(tangent_dim, state_dim)
     num_neighbors = knn_idx.size(1)
-    neighbor_states = states.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors, state_dim)
+    candidate_states = states
+    if reference_states is not None and reference_states.numel() > 0:
+        candidate_states = torch.cat(
+            [
+                states,
+                reference_states.to(device=states.device, dtype=states.dtype),
+            ],
+            dim=0,
+        )
+    neighbor_states = candidate_states.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors, state_dim)
     delta = neighbor_states - states.unsqueeze(1)
     cov = torch.einsum("bk,bkd,bke->bde", knn_weights, delta, delta)
     with torch.autocast(device_type=states.device.type, enabled=False):
@@ -371,7 +1098,16 @@ def _local_response_jet_bundle(
     projector = frame @ frame.transpose(-1, -2)
     coords = torch.einsum("bkd,bdm->bkm", delta, frame)
 
-    neighbor_responses = response_channels.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors, -1)
+    candidate_responses = response_channels
+    if reference_response_channels is not None and reference_response_channels.numel() > 0:
+        candidate_responses = torch.cat(
+            [
+                response_channels,
+                reference_response_channels.to(device=states.device, dtype=response_channels.dtype),
+            ],
+            dim=0,
+        )
+    neighbor_responses = candidate_responses.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors, -1)
     channel_count = response_channels.size(1)
     quad_dim = _quadratic_feature_dim(tangent_dim)
     feature_dim = 1 + tangent_dim + quad_dim
@@ -453,18 +1189,59 @@ def _local_response_jet_bundle(
         keepdim=True,
     ).clamp_min(1e-6)
 
-    neighbor_frame = frame.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors, state_dim, tangent_dim)
-    center_frame = frame.unsqueeze(1).expand(-1, num_neighbors, -1, -1)
-    overlap = torch.matmul(neighbor_frame.transpose(-1, -2).float(), center_frame.float())
-    with torch.autocast(device_type=states.device.type, enabled=False):
-        u, _, vh = torch.linalg.svd(overlap.float(), full_matrices=False)
-    transport = (u @ vh).to(dtype=states.dtype)
+    transport = None
+    neighbor_idx_out = None
+    neighbor_weights_out = None
+    reference_neighbor_ratio = zero_scalar
+    if neighborhood.reference_mask is not None:
+        reference_neighbor_ratio = neighborhood.reference_mask.float().mean().to(dtype=states.dtype)
+    candidate_frames = frame
+    candidate_frame_valid = torch.ones(batch, device=states.device, dtype=torch.bool)
+    if reference_tangent_frames is not None and reference_tangent_frames.numel() > 0:
+        candidate_frames = torch.cat(
+            [
+                frame,
+                reference_tangent_frames.to(device=states.device, dtype=states.dtype),
+            ],
+            dim=0,
+        )
+        if reference_tangent_frame_valid is None:
+            reference_valid = torch.ones(
+                reference_tangent_frames.size(0),
+                device=states.device,
+                dtype=torch.bool,
+            )
+        else:
+            reference_valid = reference_tangent_frame_valid.to(device=states.device, dtype=torch.bool)
+        candidate_frame_valid = torch.cat([candidate_frame_valid, reference_valid], dim=0)
+
+    neighbor_frame = candidate_frames.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors, state_dim, tangent_dim)
+    neighbor_frame_valid = candidate_frame_valid.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors)
+    if bool(neighbor_frame_valid.any().item()):
+        center_frame = frame.unsqueeze(1).expand(-1, num_neighbors, -1, -1)
+        overlap = torch.matmul(neighbor_frame.transpose(-1, -2).float(), center_frame.float())
+        with torch.autocast(device_type=states.device.type, enabled=False):
+            u, _, vh = torch.linalg.svd(overlap.float(), full_matrices=False)
+        transport = (u @ vh).to(dtype=states.dtype)
+        identity_transport = torch.eye(
+            tangent_dim,
+            device=states.device,
+            dtype=states.dtype,
+        ).view(1, 1, tangent_dim, tangent_dim)
+        transport = torch.where(
+            neighbor_frame_valid.unsqueeze(-1).unsqueeze(-1),
+            transport,
+            identity_transport,
+        )
+        neighbor_weights_out = knn_weights * neighbor_frame_valid.to(dtype=knn_weights.dtype)
+        neighbor_weights_out = neighbor_weights_out / neighbor_weights_out.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        neighbor_idx_out = knn_idx
 
     return {
         "frame": frame,
         "projector": projector,
-        "neighbor_idx": knn_idx,
-        "neighbor_weights": knn_weights,
+        "neighbor_idx": neighbor_idx_out,
+        "neighbor_weights": neighbor_weights_out,
         "transport": transport,
         "tangent_drift": tangent_drift,
         "tangent_cov": tangent_cov,
@@ -472,6 +1249,9 @@ def _local_response_jet_bundle(
         "support_tilt": support_tilt,
         "effective_rank": effective_rank_values.mean(),
         "anisotropy": anisotropy_values.mean(),
+        "neighbor_pool_size": neighbor_pool_size,
+        "reference_pool_size": reference_pool_size,
+        "reference_neighbor_ratio": reference_neighbor_ratio,
     }
 
 
@@ -531,7 +1311,10 @@ def _solve_graph_tau_target(
     p_base.scatter_(1, knn_idx, knn_weights.float())
     p_geom.scatter_(1, knn_idx, geom_weights)
 
-    residual = mu0 - p_geom.transpose(0, 1) @ mu0
+    # Only solve for the conditional increment relative to the base graph generator.
+    # This keeps tau focused on the condition-induced imbalance instead of absorbing
+    # whatever non-stationarity the base density/head already has on its own.
+    residual = p_base.transpose(0, 1) @ mu0 - p_geom.transpose(0, 1) @ mu0
     identity = torch.eye(batch, device=states.device, dtype=torch.float32)
     a_base = p_base.transpose(0, 1) - identity
     ones = torch.ones(batch, 1, device=states.device, dtype=torch.float32)
@@ -544,8 +1327,6 @@ def _solve_graph_tau_target(
     tau = nu / mu0.clamp_min(1e-6)
     weighted_mean = (tau * mu0).sum()
     tau = tau - weighted_mean
-    weighted_var = ((tau.square()) * mu0).sum().clamp_min(1e-6)
-    tau = tau / weighted_var.sqrt()
 
     correction_residual = a_base @ nu - residual
     return {
@@ -582,60 +1363,75 @@ def local_measure_targets(
     tangent_frame: torch.Tensor | None = None,
     target_model=None,
     target_cond_embed: torch.Tensor | None = None,
-) -> dict[str, torch.Tensor]:
+    geometry_reference: GeometryNeighborhoodReference | None = None,
+) -> LocalGeneratorTarget:
     if latents.size(1) < 2:
         zero_scalar = latents.new_tensor(0.0)
         zero_vector = latents.new_zeros(latents.size(0), latents.size(-1))
         zero_matrix = latents.new_zeros(latents.size(0), latents.size(-1), latents.size(-1))
-        return {
-            "signatures": latents.new_zeros(latents.size(0), response_signature_dim(latents.size(1), signature_mode)),
-            "drift_target": zero_vector,
-            "diffusion_target": zero_matrix,
-            "full_diffusion_target": zero_matrix,
-            "bootstrap_drift_target": zero_vector,
-            "bootstrap_diffusion_target": zero_matrix,
-            "target_tangent_drift": zero_vector,
-            "target_tangent_cov": None,
-            "identifiable_tangent_cov": None,
-            "target_tangent_frame": None,
-            "target_tangent_projector": None,
-            "target_neighbor_idx": None,
-            "target_neighbor_weights": None,
-            "target_transport": None,
-            "response_identifiable_effective_rank": zero_scalar,
-            "response_identifiable_anisotropy": zero_scalar,
-            "tilt_target": None,
-            "response_operator_trace": zero_scalar,
-            "response_operator_effective_rank": zero_scalar,
-            "response_operator_anisotropy": zero_scalar,
-            "response_operator_asymmetry": zero_scalar,
-            "response_drift_alignment": zero_scalar,
-        }
+        return LocalGeneratorTarget(
+            signatures=latents.new_zeros(
+                latents.size(0),
+                response_signature_dim(latents.size(1), signature_mode, channels=video.size(2)),
+            ),
+            source_point=zero_vector,
+            source_summary_context=zero_vector,
+            source_measure=None,
+            invariant_target=None,
+            drift_target=zero_vector,
+            diffusion_target=zero_matrix,
+            full_diffusion_target=zero_matrix,
+            bootstrap_drift_target=zero_vector,
+            bootstrap_diffusion_target=zero_matrix,
+            target_tangent_drift=zero_vector,
+            target_tangent_cov=None,
+            identifiable_tangent_cov=None,
+            target_tangent_frame=None,
+            target_tangent_projector=None,
+            target_neighbor_idx=None,
+            target_neighbor_weights=None,
+            target_transport=None,
+            response_identifiable_effective_rank=zero_scalar,
+            response_identifiable_anisotropy=zero_scalar,
+            tilt_target=None,
+            response_operator_trace=zero_scalar,
+            response_operator_effective_rank=zero_scalar,
+            response_operator_anisotropy=zero_scalar,
+            response_operator_asymmetry=zero_scalar,
+            response_drift_alignment=zero_scalar,
+            geometry_neighbor_pool_size=latents.new_tensor(0.0),
+            geometry_reference_pool_size=latents.new_tensor(0.0),
+            geometry_reference_neighbor_ratio=zero_scalar,
+        )
 
     source_model = target_model if target_model is not None else model
     source_cond_embed = target_cond_embed if target_cond_embed is not None else cond_embed
     source_latents = latents
     source_decoded = decoded
     if target_model is not None:
-        source_latents = source_model.encode_video(video)
+        source_latents = source_model.encode_video(video, cond_embed=source_cond_embed)
         source_decoded = source_model.decode_video(source_latents, source_cond_embed)
-    source_state = source_model.trajectory_state(source_latents)
+    source_point = source_model.trajectory_point(source_latents)
+    source_summary_context = source_model.trajectory_summary_context(source_latents)
 
+    response_bundle = None
     triangle = None
     triangle_mask = None
     needs_response_structure = (
         (measure_target_mode != "chart_moments")
         or (drift_target_mode != "bootstrap")
-        or (tilt_target_mode in {"response_support", "hybrid"})
+        or (tilt_target_mode in {"response_support", "graph_tau", "hybrid"})
     )
     if signatures is None or needs_response_structure:
-        triangle, triangle_mask = response_triangle(
+        response_bundle = response_triangle_bundle(
             model=source_model,
             latents=source_latents,
             video=video,
             cond_embed=source_cond_embed,
             decoded=source_decoded,
         )
+        triangle = response_bundle.energy_triangle
+        triangle_mask = response_bundle.mask
     if signatures is None:
         if triangle is None or triangle_mask is None:
             signatures = response_signature(
@@ -647,7 +1443,13 @@ def local_measure_targets(
                 mode=signature_mode,
             )
         else:
-            signatures = _response_signature_from_triangle(triangle, triangle_mask, signature_mode)
+            descriptor_triangle, signed_triangle, _ = response_descriptor_triangle_from_bundle(response_bundle)
+            signatures = _response_signature_from_descriptor_triangle(
+                descriptor_triangle,
+                signed_triangle,
+                triangle_mask,
+                signature_mode,
+            )
 
     chart_latents = source_model.chart_latents(source_latents)
     chart_delta = chart_latents[:, 1:] - chart_latents[:, :-1]
@@ -657,10 +1459,18 @@ def local_measure_targets(
 
     student_tangent_frame = tangent_frame
     if needs_response_structure and student_tangent_frame is None:
-        student_tangent_frame = model.trajectory_tangent_frame(latents)
+        student_tangent_frame = model.trajectory_tangent_frame(
+            latents,
+            point=model.trajectory_point(latents),
+            summary_context=model.trajectory_summary_context(latents),
+        )
     source_tangent_frame = None
     if needs_response_structure:
-        source_tangent_frame = source_model.trajectory_tangent_frame(source_latents)
+        source_tangent_frame = source_model.trajectory_tangent_frame(
+            source_latents,
+            point=source_point,
+            summary_context=source_summary_context,
+        )
     target_tangent_dim = 0
     if student_tangent_frame is not None:
         target_tangent_dim = student_tangent_frame.size(-1)
@@ -686,6 +1496,9 @@ def local_measure_targets(
     response_drift_alignment = latents.new_tensor(0.0)
     response_identifiable_effective_rank = latents.new_tensor(0.0)
     response_identifiable_anisotropy = latents.new_tensor(0.0)
+    geometry_neighbor_pool_size = latents.new_tensor(float(source_point.size(0)))
+    geometry_reference_pool_size = latents.new_tensor(0.0)
+    geometry_reference_neighbor_ratio = latents.new_tensor(0.0)
 
     if measure_target_mode not in {"chart_moments", "response_invariant_bootstrap", "hybrid", "response_jet"}:
         raise ValueError(f"Unsupported measure_target_mode: {measure_target_mode}")
@@ -697,62 +1510,49 @@ def local_measure_targets(
     tilt_target = None
     teacher_tilt_target = None
     base_log_density_target = None
+    source_measure = None
+    invariant_target = None
     if tilt_target_mode in {"teacher_tilt", "hybrid", "graph_tau"} or source_model.measure_density_mode == "tilted":
-        base_log_density_target, teacher_tilt_target, total_log_density_target = source_model.measure_log_density_components(
+        source_measure = source_model.conditional_measure(
             source_latents,
             source_cond_embed,
-            state=source_state,
+            state=source_point,
         )
+        base_log_density_target = source_measure.log_base_density
+        teacher_tilt_target = source_measure.log_tilt
+        total_log_density_target = source_measure.log_total_density
         if source_model.measure_density_mode != "tilted":
-            base_log_density_target = total_log_density_target
             teacher_tilt_target = None
 
-    response_operator = None
-    response_channels = None
-    response_jet = None
-    graph_tau_target = None
-    if needs_response_structure and triangle is not None and triangle_mask is not None:
-        response_channels = _flatten_response_channels(triangle, triangle_mask)
-        if target_tangent_dim > 0:
-            response_jet = _local_response_jet_bundle(
-                source_state,
-                response_channels,
-                tangent_dim=target_tangent_dim,
-                knn=geometry_knn,
-                temperature=geometry_temperature,
-                ridge=jet_ridge,
-                center_weight=jet_center_weight,
-            )
-            if tilt_target_mode == "graph_tau" and base_log_density_target is not None:
-                graph_tau_bundle = _solve_graph_tau_target(
-                    source_state,
-                    base_log_density_target,
-                    jet_bundle=response_jet,
-                    temperature=geometry_temperature,
-                    ridge=tau_ridge,
-                    mean_penalty=tau_mean_penalty,
-                    drift_scale=tau_drift_scale,
-                )
-                graph_tau_target = graph_tau_bundle["tau"]
-        response_operator = _response_operator_from_triangle(triangle, triangle_mask)
-        response_operator_trace = response_operator["trace"].mean()
-        response_operator_effective_rank = response_operator["effective_rank"].mean()
-        response_operator_anisotropy = response_operator["anisotropy"].mean()
-        response_operator_asymmetry = response_operator["asymmetry"].mean()
-
-        response_support_target = torch.log(response_operator["trace"].clamp_min(1e-6)).unsqueeze(-1)
-        response_support_target = response_support_target + 0.25 * response_operator["anisotropy"].unsqueeze(-1)
-        response_support_target = response_support_target + 0.25 * response_operator["asymmetry"].abs().unsqueeze(-1)
-        response_support_target = (
-            response_support_target - response_support_target.mean(dim=0, keepdim=True)
-        ) / response_support_target.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
-        if response_jet is not None and response_jet["support_tilt"] is not None:
-            response_support_target = response_jet["support_tilt"]
+    if needs_response_structure and response_bundle is not None and triangle is not None and triangle_mask is not None:
+        invariant_target = build_response_invariant_target(
+            source_point,
+            response_bundle,
+            tangent_dim=target_tangent_dim,
+            geometry_knn=geometry_knn,
+            geometry_temperature=geometry_temperature,
+            jet_ridge=jet_ridge,
+            jet_center_weight=jet_center_weight,
+            base_log_density_target=base_log_density_target,
+            tilt_target_mode=tilt_target_mode,
+            tau_ridge=tau_ridge,
+            tau_mean_penalty=tau_mean_penalty,
+            tau_drift_scale=tau_drift_scale,
+            geometry_reference=geometry_reference,
+        )
+        response_operator_trace = invariant_target.trace.mean()
+        response_operator_effective_rank = invariant_target.effective_rank.mean()
+        response_operator_anisotropy = invariant_target.anisotropy.mean()
+        response_operator_asymmetry = invariant_target.asymmetry.mean()
+        geometry_neighbor_pool_size = invariant_target.neighbor_pool_size
+        geometry_reference_pool_size = invariant_target.reference_pool_size
+        geometry_reference_neighbor_ratio = invariant_target.reference_neighbor_ratio
+        response_support_target = invariant_target.support_tilt
 
         if tilt_target_mode == "response_support":
             tilt_target = response_support_target
         elif tilt_target_mode == "graph_tau":
-            tilt_target = graph_tau_target if graph_tau_target is not None else response_support_target
+            tilt_target = invariant_target.graph_tau if invariant_target.graph_tau is not None else response_support_target
         elif tilt_target_mode == "hybrid":
             if teacher_tilt_target is None:
                 tilt_target = response_support_target
@@ -760,14 +1560,14 @@ def local_measure_targets(
                 tilt_blend = float(min(max(tilt_target_blend, 0.0), 1.0))
                 tilt_target = (1.0 - tilt_blend) * teacher_tilt_target + tilt_blend * response_support_target
 
-        if response_jet is not None:
-            target_tangent_frame = response_jet["frame"]
-            target_tangent_projector = response_jet["projector"]
-            target_neighbor_idx = response_jet["neighbor_idx"]
-            target_neighbor_weights = response_jet["neighbor_weights"]
-            target_transport = response_jet["transport"]
-            response_identifiable_effective_rank = response_jet["effective_rank"]
-            response_identifiable_anisotropy = response_jet["anisotropy"]
+        if invariant_target.tangent_frame is not None:
+            target_tangent_frame = invariant_target.tangent_frame
+            target_tangent_projector = invariant_target.tangent_projector
+            target_neighbor_idx = invariant_target.neighbor_idx
+            target_neighbor_weights = invariant_target.neighbor_weights
+            target_transport = invariant_target.transport
+            response_identifiable_effective_rank = invariant_target.identifiable_effective_rank
+            response_identifiable_anisotropy = invariant_target.identifiable_anisotropy
 
         if student_tangent_frame is not None:
             if source_tangent_frame is not None:
@@ -785,10 +1585,10 @@ def local_measure_targets(
             bootstrap_tangent_drift = source_bootstrap_tangent_drift
             asym_tangent_drift = torch.zeros_like(bootstrap_tangent_drift)
             drift_scale = source_bootstrap_tangent_drift.norm(dim=-1, keepdim=True)
-            asym_value = response_operator["asymmetry"].unsqueeze(-1)
+            asym_value = invariant_target.asymmetry.unsqueeze(-1)
             asym_tangent_drift[:, :1] = torch.sign(asym_value) * drift_scale * asym_value.abs().clamp_max(1.0)
-            if drift_target_mode == "response_jet" and response_jet is not None and response_jet["tangent_drift"] is not None:
-                target_tangent_drift = response_jet["tangent_drift"]
+            if drift_target_mode == "response_jet" and invariant_target.tangent_drift is not None:
+                target_tangent_drift = invariant_target.tangent_drift
                 if target_tangent_frame is not None:
                     drift_target = torch.einsum("bij,bj->bi", target_tangent_frame, target_tangent_drift)
                 else:
@@ -806,37 +1606,42 @@ def local_measure_targets(
                 target_tangent_drift = (1.0 - drift_blend) * bootstrap_tangent_drift + drift_blend * asym_tangent_drift
             else:
                 target_tangent_drift = bootstrap_tangent_drift
-            if drift_target_mode != "response_jet" or response_jet is None:
+            if drift_target_mode != "response_jet" or invariant_target.tangent_drift is None:
                 drift_target = torch.einsum("bij,bj->bi", student_tangent_frame, target_tangent_drift)
                 response_drift_alignment = F.mse_loss(bootstrap_tangent_drift[:, :1], asym_tangent_drift[:, :1])
 
         if measure_target_mode != "chart_moments" and student_tangent_frame is not None:
-            if measure_target_mode == "response_jet" and response_jet is not None and response_jet["tangent_cov"] is not None:
-                target_tangent_cov = response_jet["tangent_cov"]
-                identifiable_tangent_cov = response_jet["identifiable_tangent_cov"]
+            if measure_target_mode == "response_jet" and invariant_target.tangent_cov is not None:
+                target_tangent_cov = invariant_target.tangent_cov
+                identifiable_tangent_cov = invariant_target.identifiable_tangent_cov
                 if target_tangent_frame is not None:
                     full_diffusion_target = (
                         target_tangent_frame @ target_tangent_cov @ target_tangent_frame.transpose(-1, -2)
                     )
             else:
                 tangent_dim = student_tangent_frame.size(-1)
-                target_eigs = response_operator["eigvals"][:, : min(tangent_dim, response_operator["eigvals"].size(-1))]
-                spectral_weights = target_eigs / target_eigs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-                if tangent_dim > spectral_weights.size(1):
-                    spectral_weights = F.pad(spectral_weights, (0, tangent_dim - spectral_weights.size(1)))
-                spectral_weights = spectral_weights.clamp_min(1e-8)
-                spectral_weights = spectral_weights / spectral_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-                identifiable_tangent_cov = torch.diag_embed(spectral_weights)
-                response_identifiable_effective_rank = torch.exp(
-                    -(spectral_weights * spectral_weights.clamp_min(1e-8).log()).sum(dim=-1)
-                ).mean()
-                response_identifiable_anisotropy = torch.log(spectral_weights.clamp_min(1e-8)).std(
-                    dim=-1,
-                    unbiased=False,
-                ).mean()
+                identifiable_tangent_cov = invariant_target.identifiable_tangent_cov
+                if identifiable_tangent_cov is None:
+                    target_eigs = invariant_target.eigvals[:, : min(tangent_dim, invariant_target.eigvals.size(-1))]
+                    spectral_weights = target_eigs / target_eigs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                    if tangent_dim > spectral_weights.size(1):
+                        spectral_weights = F.pad(spectral_weights, (0, tangent_dim - spectral_weights.size(1)))
+                    spectral_weights = spectral_weights.clamp_min(1e-8)
+                    spectral_weights = spectral_weights / spectral_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                    identifiable_tangent_cov = torch.diag_embed(spectral_weights)
+                    response_identifiable_effective_rank = torch.exp(
+                        -(spectral_weights * spectral_weights.clamp_min(1e-8).log()).sum(dim=-1)
+                    ).mean()
+                    response_identifiable_anisotropy = torch.log(spectral_weights.clamp_min(1e-8)).std(
+                        dim=-1,
+                        unbiased=False,
+                    ).mean()
+                else:
+                    response_identifiable_effective_rank = invariant_target.identifiable_effective_rank
+                    response_identifiable_anisotropy = invariant_target.identifiable_anisotropy
                 bootstrap_trace = bootstrap_full_diffusion_target.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-                invariant_diag = bootstrap_trace.unsqueeze(-1) * spectral_weights
-                invariant_tangent_cov = torch.diag_embed(invariant_diag.clamp_min(1e-8))
+                invariant_trace = identifiable_tangent_cov.diagonal(dim1=-2, dim2=-1).sum(dim=-1).clamp_min(1e-8)
+                invariant_tangent_cov = identifiable_tangent_cov * (bootstrap_trace / invariant_trace).view(-1, 1, 1)
                 bootstrap_tangent_cov = (
                     student_tangent_frame.transpose(-1, -2) @ bootstrap_full_diffusion_target @ student_tangent_frame
                 )
@@ -870,30 +1675,37 @@ def local_measure_targets(
     else:
         tangent_drift_target_out = target_tangent_drift
 
-    return {
-        "signatures": signatures,
-        "drift_target": drift_target,
-        "diffusion_target": diffusion_target,
-        "full_diffusion_target": full_diffusion_target,
-        "bootstrap_drift_target": bootstrap_drift_target,
-        "bootstrap_diffusion_target": bootstrap_full_diffusion_target,
-        "target_tangent_drift": tangent_drift_target_out,
-        "target_tangent_cov": target_tangent_cov,
-        "identifiable_tangent_cov": identifiable_tangent_cov,
-        "target_tangent_frame": target_tangent_frame,
-        "target_tangent_projector": target_tangent_projector,
-        "target_neighbor_idx": target_neighbor_idx,
-        "target_neighbor_weights": target_neighbor_weights,
-        "target_transport": target_transport,
-        "response_identifiable_effective_rank": response_identifiable_effective_rank,
-        "response_identifiable_anisotropy": response_identifiable_anisotropy,
-        "tilt_target": tilt_target,
-        "response_operator_trace": response_operator_trace,
-        "response_operator_effective_rank": response_operator_effective_rank,
-        "response_operator_anisotropy": response_operator_anisotropy,
-        "response_operator_asymmetry": response_operator_asymmetry,
-        "response_drift_alignment": response_drift_alignment,
-    }
+    return LocalGeneratorTarget(
+        signatures=signatures,
+        source_point=source_point,
+        source_summary_context=source_summary_context,
+        source_measure=source_measure,
+        invariant_target=invariant_target,
+        drift_target=drift_target,
+        diffusion_target=diffusion_target,
+        full_diffusion_target=full_diffusion_target,
+        bootstrap_drift_target=bootstrap_drift_target,
+        bootstrap_diffusion_target=bootstrap_full_diffusion_target,
+        target_tangent_drift=tangent_drift_target_out,
+        target_tangent_cov=target_tangent_cov,
+        identifiable_tangent_cov=identifiable_tangent_cov,
+        target_tangent_frame=target_tangent_frame,
+        target_tangent_projector=target_tangent_projector,
+        target_neighbor_idx=target_neighbor_idx,
+        target_neighbor_weights=target_neighbor_weights,
+        target_transport=target_transport,
+        response_identifiable_effective_rank=response_identifiable_effective_rank,
+        response_identifiable_anisotropy=response_identifiable_anisotropy,
+        tilt_target=tilt_target,
+        response_operator_trace=response_operator_trace,
+        response_operator_effective_rank=response_operator_effective_rank,
+        response_operator_anisotropy=response_operator_anisotropy,
+        response_operator_asymmetry=response_operator_asymmetry,
+        response_drift_alignment=response_drift_alignment,
+        geometry_neighbor_pool_size=geometry_neighbor_pool_size,
+        geometry_reference_pool_size=geometry_reference_pool_size,
+        geometry_reference_neighbor_ratio=geometry_reference_neighbor_ratio,
+    )
 
 
 @torch.no_grad()
@@ -907,15 +1719,21 @@ def response_signature(
 ) -> torch.Tensor:
     batch, steps, *_ = video.shape
     if steps < 2:
-        return latents.new_zeros(batch, response_signature_dim(steps, mode))
-    triangle, mask = response_triangle(
+        return latents.new_zeros(batch, response_signature_dim(steps, mode, channels=video.size(2)))
+    bundle = response_triangle_bundle(
         model=model,
         latents=latents,
         video=video,
         cond_embed=cond_embed,
         decoded=decoded,
     )
-    return _response_signature_from_triangle(triangle, mask, mode)
+    descriptor_triangle, signed_triangle, _ = response_descriptor_triangle_from_bundle(bundle)
+    return _response_signature_from_descriptor_triangle(
+        descriptor_triangle,
+        signed_triangle,
+        bundle.mask,
+        mode,
+    )
 
 
 def local_neighbor_smoothness_loss(
@@ -924,23 +1742,42 @@ def local_neighbor_smoothness_loss(
     *,
     knn: int,
     temperature: float,
+    reference_signatures: torch.Tensor | None = None,
+    reference_fields: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     batch = signatures.size(0)
-    if batch < 2 or knn <= 0:
+    reference_count = 0 if reference_signatures is None else int(reference_signatures.size(0))
+    if batch < 1 or batch + reference_count < 2 or knn <= 0:
+        return signatures.new_tensor(0.0)
+    if reference_fields is not None and len(reference_fields) != len(fields):
+        raise ValueError("reference_fields must match fields length")
+    neighborhood = _build_knn_graph(
+        signatures,
+        knn=knn,
+        temperature=temperature,
+        reference_points=reference_signatures,
+    )
+    knn_idx = neighborhood.knn_idx
+    weights = neighborhood.weights
+    if knn_idx is None or weights is None:
         return signatures.new_tensor(0.0)
 
-    num_neighbors = min(knn, batch - 1)
-    distance = torch.cdist(signatures.detach(), signatures.detach(), p=2.0)
-    inf = torch.full_like(distance.diagonal(), float("inf"))
-    distance = distance.clone()
-    distance.diagonal().copy_(inf)
-    knn_dist, knn_idx = torch.topk(distance, k=num_neighbors, largest=False, dim=1)
-    weights = torch.softmax(-knn_dist / max(temperature, 1e-4), dim=1)
-
     total = signatures.new_tensor(0.0)
-    for field in fields:
+    for field_idx, field in enumerate(fields):
         flat_field = field if field.ndim == 2 else field.unsqueeze(1)
-        neighbor_field = flat_field.index_select(0, knn_idx.reshape(-1)).view(batch, num_neighbors, -1)
+        candidate_field = flat_field
+        if reference_fields is not None:
+            reference_field = reference_fields[field_idx]
+            if reference_field is not None and reference_field.numel() > 0:
+                reference_field = reference_field if reference_field.ndim == 2 else reference_field.unsqueeze(1)
+                candidate_field = torch.cat(
+                    [
+                        flat_field,
+                        reference_field.to(device=flat_field.device, dtype=flat_field.dtype),
+                    ],
+                    dim=0,
+                )
+        neighbor_field = candidate_field.index_select(0, knn_idx.reshape(-1)).view(batch, knn_idx.size(1), -1)
         diff = flat_field.unsqueeze(1) - neighbor_field
         total = total + (weights.unsqueeze(-1) * diff.square()).sum(dim=1).mean()
 
@@ -967,6 +1804,57 @@ def _sorted_eigvalsh(matrix: torch.Tensor) -> torch.Tensor:
     eigvals = torch.linalg.eigvalsh(matrix.float())
     eigvals = torch.flip(eigvals, dims=(-1,))
     return eigvals
+
+
+def identification_nontriviality_loss(
+    pred_eigs: torch.Tensor,
+    target_eigs: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    pred_eigs = pred_eigs.clamp_min(eps)
+    target_eigs = target_eigs.clamp_min(eps)
+
+    pred_log = torch.log(pred_eigs)
+    target_log = torch.log(target_eigs)
+    pred_anisotropy = pred_log.std(dim=-1, unbiased=False)
+    target_anisotropy = target_log.std(dim=-1, unbiased=False)
+
+    pred_weights = pred_eigs / pred_eigs.sum(dim=-1, keepdim=True).clamp_min(eps)
+    target_weights = target_eigs / target_eigs.sum(dim=-1, keepdim=True).clamp_min(eps)
+    pred_effective_rank = torch.exp(-(pred_weights * pred_weights.clamp_min(eps).log()).sum(dim=-1))
+    target_effective_rank = torch.exp(-(target_weights * target_weights.clamp_min(eps).log()).sum(dim=-1))
+
+    if pred_eigs.size(-1) > 1:
+        pred_gap = (pred_eigs[..., 0] - pred_eigs[..., 1]) / pred_eigs.sum(dim=-1).clamp_min(eps)
+        target_gap = (target_eigs[..., 0] - target_eigs[..., 1]) / target_eigs.sum(dim=-1).clamp_min(eps)
+    else:
+        pred_gap = pred_eigs[..., 0] / pred_eigs.sum(dim=-1).clamp_min(eps)
+        target_gap = target_eigs[..., 0] / target_eigs.sum(dim=-1).clamp_min(eps)
+
+    anisotropy_floor = F.relu(target_anisotropy - pred_anisotropy)
+    rank_ceiling = F.relu(pred_effective_rank - target_effective_rank)
+    gap_floor = F.relu(target_gap - pred_gap)
+    loss = anisotropy_floor.mean() + rank_ceiling.mean() + gap_floor.mean()
+    return loss, {
+        "pred_effective_rank": pred_effective_rank.mean(),
+        "target_effective_rank": target_effective_rank.mean(),
+        "pred_anisotropy": pred_anisotropy.mean(),
+        "target_anisotropy": target_anisotropy.mean(),
+        "pred_spectral_gap": pred_gap.mean(),
+        "target_spectral_gap": target_gap.mean(),
+    }
+
+
+def tilt_overreach_loss(
+    tilt_log_density: torch.Tensor,
+    *,
+    geometry_signal: torch.Tensor,
+    geometry_residual: torch.Tensor,
+) -> torch.Tensor:
+    signal_gate = torch.tanh(geometry_signal.detach().clamp_min(0.0))
+    residual_gate = torch.tanh(geometry_residual.detach().clamp_min(0.0))
+    return tilt_log_density.abs().mean() * signal_gate * residual_gate
 
 
 def local_measure_loss(
@@ -999,6 +1887,8 @@ def local_measure_loss(
     decoded: torch.Tensor | None = None,
     target_model=None,
     target_cond_embed: torch.Tensor | None = None,
+    geometry_reference: GeometryNeighborhoodReference | None = None,
+    smoothness_reference: SmoothnessNeighborhoodReference | None = None,
 ) -> dict[str, torch.Tensor]:
     if latents.size(1) < 2:
         zero = latents.new_tensor(0.0)
@@ -1026,6 +1916,7 @@ def local_measure_loss(
             "tangent_projector_trace": zero,
             "tangent_spectrum_alignment": zero,
             "tangent_shape_alignment": zero,
+            "tangent_nontriviality": zero,
             "tangent_anisotropy_gap": zero,
             "pred_tangent_effective_rank": zero,
             "target_tangent_effective_rank": zero,
@@ -1033,6 +1924,8 @@ def local_measure_loss(
             "target_tangent_anisotropy": zero,
             "pred_tangent_trace": zero,
             "target_tangent_trace": zero,
+            "pred_tangent_spectral_gap": zero,
+            "target_tangent_spectral_gap": zero,
             "response_operator_trace": zero,
             "response_operator_effective_rank": zero,
             "response_operator_anisotropy": zero,
@@ -1040,9 +1933,20 @@ def local_measure_loss(
             "response_identifiable_effective_rank": zero,
             "response_identifiable_anisotropy": zero,
             "response_drift_alignment": zero,
+            "measure_tilt_overreach": zero,
+            "generator_base_trace": zero,
+            "generator_delta_trace": zero,
+            "generator_delta_drift_norm": zero,
+            "generator_delta_diffusion_norm": zero,
+            "generator_delta_tilt_abs_mean": zero,
+            "generator_delta_budget": zero,
+            "response_geometry_pool_size": zero,
+            "response_geometry_reference_pool_size": zero,
+            "response_geometry_reference_neighbor_ratio": zero,
+            "response_smoothness_pool_size": zero,
         }
 
-    state = model.trajectory_state(latents)
+    state = model.trajectory_point(latents)
     target_bundle = local_measure_targets(
         model=model,
         latents=latents,
@@ -1067,83 +1971,61 @@ def local_measure_loss(
         decoded=decoded,
         target_model=target_model,
         target_cond_embed=target_cond_embed,
+        geometry_reference=geometry_reference,
     )
-    signatures = target_bundle["signatures"]
-    drift = model.trajectory_drift(latents, cond_embed)
-    tangent_structure = model.local_tangent_structure(
+    signatures = target_bundle.signatures
+    generator = model.local_generator(
         latents,
         cond_embed,
         response_context=signatures,
         state=state,
     )
-    diffusion_matrix = model.local_diffusion_matrix(
-        latents,
-        cond_embed,
-        response_context=signatures,
-        state=state,
-        tangent_structure=tangent_structure,
-    )
-    tangent_core_cov = model.local_tangent_covariance(
-        latents,
-        cond_embed,
-        response_context=signatures,
-        state=state,
-        tangent_structure=tangent_structure,
-    )
+    drift = generator.drift
+    tangent_structure = generator.tangent_structure
+    diffusion_matrix = generator.diffusion_matrix
+    tangent_core_cov = generator.tangent_core_cov
     diffusion_diag = diffusion_matrix.diagonal(dim1=-2, dim2=-1)
-    _, tilt_log_density, total_log_density = model.measure_log_density_components(
-        latents,
-        cond_embed,
-        state=state,
-    )
-    log_density = total_log_density.squeeze(-1)
+    conditional_measure = generator.conditional_measure
+    tilt_log_density = conditional_measure.log_tilt
+    log_density = conditional_measure.log_total_density.squeeze(-1)
+    base_generator = generator.base_generator
+    conditional_delta = generator.conditional_delta
     chart_latents = model.chart_latents(latents)
     chart_delta = chart_latents[:, 1:] - chart_latents[:, :-1]
 
-    drift_target = target_bundle["drift_target"]
-    diffusion_target = target_bundle["diffusion_target"]
-    full_diffusion_target = target_bundle["full_diffusion_target"]
-    target_tangent_cov = target_bundle["target_tangent_cov"]
-    identifiable_tangent_cov = target_bundle["identifiable_tangent_cov"]
-    target_tangent_frame = target_bundle["target_tangent_frame"]
-    target_tangent_projector = target_bundle["target_tangent_projector"]
-    target_neighbor_idx = target_bundle["target_neighbor_idx"]
-    target_neighbor_weights = target_bundle["target_neighbor_weights"]
-    target_transport = target_bundle["target_transport"]
-    tilt_target = target_bundle["tilt_target"]
+    drift_target = target_bundle.drift_target
+    diffusion_target = target_bundle.diffusion_target
+    full_diffusion_target = target_bundle.full_diffusion_target
+    target_tangent_cov = target_bundle.target_tangent_cov
+    identifiable_tangent_cov = target_bundle.identifiable_tangent_cov
+    target_tangent_frame = target_bundle.target_tangent_frame
+    target_tangent_projector = target_bundle.target_tangent_projector
+    target_neighbor_idx = target_bundle.target_neighbor_idx
+    target_neighbor_weights = target_bundle.target_neighbor_weights
+    target_transport = target_bundle.target_transport
+    tilt_target = target_bundle.tilt_target
+    invariant_target = target_bundle.invariant_target
 
     drift_loss = F.mse_loss(drift, drift_target)
     diffusion_loss = F.mse_loss(diffusion_matrix, diffusion_target)
     tilt_alignment = latents.new_tensor(0.0) if tilt_target is None else F.mse_loss(tilt_log_density, tilt_target)
 
-    density_weights = posterior_from_logits(log_density.unsqueeze(0), temperature=density_temperature).squeeze(0)
+    density_weights = generator.density_weights(temperature=density_temperature)
     directions = _measure_test_directions(
         state.size(1),
         test_num_directions,
         device=state.device,
         dtype=state.dtype,
     )
-    projected_state = state @ directions.T
-    projected_drift = drift @ directions.T
-    projected_diffusion = torch.einsum("bde,kd,ke->bk", diffusion_matrix, directions, directions)
+    projected_state = generator.state @ directions.T
+    projected_drift = generator.apply_linear(directions)
+    projected_diffusion = torch.einsum("bde,kd,ke->bk", generator.diffusion_matrix, directions, directions)
 
-    linear_moment = (density_weights.unsqueeze(1) * projected_drift).sum(dim=0)
-    quadratic_moment = (
-        density_weights.unsqueeze(1)
-        * (2.0 * projected_state * projected_drift + projected_diffusion)
-    ).sum(dim=0)
-    trig_scale = max(trig_scale, 1e-4)
-    trig_moment = (
-        density_weights.unsqueeze(1)
-        * (
-            trig_scale * torch.cos(trig_scale * projected_state) * projected_drift
-            - 0.5 * (trig_scale**2) * torch.sin(trig_scale * projected_state) * projected_diffusion
-        )
-    ).sum(dim=0)
-    radial_moment = (
-        density_weights * (2.0 * (state * drift).sum(dim=1) + diffusion_diag.sum(dim=1))
-    ).sum()
-    pred_trace = diffusion_diag.sum(dim=1)
+    linear_moment = (density_weights.unsqueeze(1) * generator.apply_linear(directions)).sum(dim=0)
+    quadratic_moment = (density_weights.unsqueeze(1) * generator.apply_quadratic(directions)).sum(dim=0)
+    trig_moment = (density_weights.unsqueeze(1) * generator.apply_trig(directions, trig_scale)).sum(dim=0)
+    radial_moment = (density_weights * generator.apply_radial()).sum()
+    pred_trace = generator.trace()
     target_trace = full_diffusion_target.diagonal(dim1=-2, dim2=-1).sum(dim=1)
     trace_alignment = (
         torch.log(pred_trace.clamp_min(1e-8)) - torch.log(target_trace.clamp_min(1e-8))
@@ -1160,6 +2042,18 @@ def local_measure_loss(
         fields=[state, drift, diffusion_matrix.flatten(1), log_density],
         knn=signature_knn,
         temperature=signature_temperature,
+        reference_signatures=None if smoothness_reference is None else smoothness_reference.signatures,
+        reference_fields=None
+        if smoothness_reference is None
+        else [
+            smoothness_reference.state,
+            smoothness_reference.drift,
+            smoothness_reference.diffusion_flat,
+            smoothness_reference.log_density,
+        ],
+    )
+    smoothness_pool_size = signatures.new_tensor(
+        float(signatures.size(0) + (0 if smoothness_reference is None else smoothness_reference.size()))
     )
     tangent_projector = tangent_structure["projector"] if tangent_structure is not None else model.trajectory_tangent_projector(latents)
     tangent_diag = model.trajectory_tangent_diagnostics(latents)
@@ -1170,6 +2064,7 @@ def local_measure_loss(
         tangent_bundle_compatibility = latents.new_tensor(0.0)
         tangent_spectrum_alignment = latents.new_tensor(0.0)
         tangent_shape_alignment = latents.new_tensor(0.0)
+        tangent_nontriviality = latents.new_tensor(0.0)
         tangent_anisotropy_gap = latents.new_tensor(0.0)
         pred_tangent_effective_rank = latents.new_tensor(0.0)
         target_tangent_effective_rank = latents.new_tensor(0.0)
@@ -1177,6 +2072,8 @@ def local_measure_loss(
         target_tangent_anisotropy = latents.new_tensor(0.0)
         pred_tangent_trace = latents.new_tensor(0.0)
         target_tangent_trace = latents.new_tensor(0.0)
+        pred_tangent_spectral_gap = latents.new_tensor(0.0)
+        target_tangent_spectral_gap = latents.new_tensor(0.0)
     else:
         tangent_observation = torch.einsum("bij,btj->bti", tangent_projector, chart_delta)
         tangent_observation_residual = F.mse_loss(tangent_observation, chart_delta)
@@ -1197,7 +2094,16 @@ def local_measure_loss(
             and target_transport is not None
         ):
             pred_frame = tangent_structure["frame"]
-            neighbor_pred_frame = pred_frame.index_select(0, target_neighbor_idx.reshape(-1)).view(
+            candidate_pred_frame = pred_frame
+            if geometry_reference is not None and geometry_reference.tangent_frames is not None:
+                candidate_pred_frame = torch.cat(
+                    [
+                        pred_frame,
+                        geometry_reference.tangent_frames.to(device=pred_frame.device, dtype=pred_frame.dtype),
+                    ],
+                    dim=0,
+                )
+            neighbor_pred_frame = candidate_pred_frame.index_select(0, target_neighbor_idx.reshape(-1)).view(
                 pred_frame.size(0),
                 target_neighbor_idx.size(1),
                 pred_frame.size(1),
@@ -1218,6 +2124,7 @@ def local_measure_loss(
         if tangent_core_cov is None or tangent_structure is None:
             tangent_spectrum_alignment = latents.new_tensor(0.0)
             tangent_shape_alignment = latents.new_tensor(0.0)
+            tangent_nontriviality = latents.new_tensor(0.0)
             tangent_anisotropy_gap = latents.new_tensor(0.0)
             pred_tangent_effective_rank = latents.new_tensor(0.0)
             target_tangent_effective_rank = latents.new_tensor(0.0)
@@ -1225,6 +2132,8 @@ def local_measure_loss(
             target_tangent_anisotropy = latents.new_tensor(0.0)
             pred_tangent_trace = latents.new_tensor(0.0)
             target_tangent_trace = latents.new_tensor(0.0)
+            pred_tangent_spectral_gap = latents.new_tensor(0.0)
+            target_tangent_spectral_gap = latents.new_tensor(0.0)
         else:
             if target_tangent_cov is None:
                 frame = tangent_structure["frame"]
@@ -1241,8 +2150,19 @@ def local_measure_loss(
             pred_weights = pred_tangent_eigs / pred_tangent_eigs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             pred_entropy = -(pred_weights * pred_weights.clamp_min(1e-8).log()).sum(dim=-1)
             pred_tangent_effective_rank = torch.exp(pred_entropy).mean()
+            pred_tangent_spectral_gap = (
+                (pred_tangent_eigs[:, 0] - pred_tangent_eigs[:, 1]) / pred_tangent_eigs.sum(dim=-1).clamp_min(1e-8)
+                if pred_tangent_eigs.size(1) > 1
+                else pred_tangent_eigs[:, 0] / pred_tangent_eigs.sum(dim=-1).clamp_min(1e-8)
+            ).mean()
+            target_tangent_spectral_gap = (
+                (target_tangent_eigs[:, 0] - target_tangent_eigs[:, 1]) / target_tangent_eigs.sum(dim=-1).clamp_min(1e-8)
+                if target_tangent_eigs.size(1) > 1
+                else target_tangent_eigs[:, 0] / target_tangent_eigs.sum(dim=-1).clamp_min(1e-8)
+            ).mean()
             if identifiable_tangent_cov is None:
                 tangent_shape_alignment = latents.new_tensor(0.0)
+                tangent_nontriviality = latents.new_tensor(0.0)
                 tangent_anisotropy_gap = latents.new_tensor(0.0)
                 target_tangent_effective_rank = latents.new_tensor(0.0)
             else:
@@ -1257,16 +2177,61 @@ def local_measure_loss(
                     pred_centered_log_spectrum,
                     identifiable_centered_log_spectrum,
                 )
-                target_tangent_effective_rank = target_bundle["response_identifiable_effective_rank"]
+                target_tangent_effective_rank = target_bundle.response_identifiable_effective_rank
+                tangent_nontriviality, nontriviality_stats = identification_nontriviality_loss(
+                    pred_tangent_eigs,
+                    identifiable_tangent_eigs,
+                )
                 tangent_anisotropy_gap = (
-                    pred_tangent_anisotropy - target_bundle["response_identifiable_anisotropy"]
+                    pred_tangent_anisotropy - target_bundle.response_identifiable_anisotropy
                 ).abs()
                 if not torch.is_tensor(target_tangent_effective_rank):
                     target_tangent_effective_rank = latents.new_tensor(float(target_tangent_effective_rank))
+                pred_tangent_effective_rank = nontriviality_stats["pred_effective_rank"]
+                target_tangent_effective_rank = nontriviality_stats["target_effective_rank"]
+                pred_tangent_anisotropy = nontriviality_stats["pred_anisotropy"]
+                target_tangent_anisotropy = nontriviality_stats["target_anisotropy"]
+                pred_tangent_spectral_gap = nontriviality_stats["pred_spectral_gap"]
+                target_tangent_spectral_gap = nontriviality_stats["target_spectral_gap"]
     if tangent_projector is None:
         tangent_projection = latents.new_tensor(0.0)
 
+    if invariant_target is None:
+        measure_tilt_overreach = latents.new_tensor(0.0)
+    else:
+        geometry_signal = (
+            invariant_target.anisotropy.mean()
+            + invariant_target.spectral_gap.mean()
+            + invariant_target.asymmetry.abs().mean()
+        )
+        geometry_residual = (
+            drift_loss.detach()
+            + diffusion_loss.detach()
+            + tangent_projection.detach()
+            + tangent_spectrum_alignment.detach()
+            + tangent_shape_alignment.detach()
+        )
+        measure_tilt_overreach = tilt_overreach_loss(
+            tilt_log_density,
+            geometry_signal=geometry_signal,
+            geometry_residual=geometry_residual,
+        )
+
     density_entropy = -(density_weights * density_weights.clamp_min(1e-12).log()).sum()
+    if base_generator is None or conditional_delta is None:
+        generator_base_trace = latents.new_tensor(0.0)
+        generator_delta_trace = latents.new_tensor(0.0)
+        generator_delta_drift_norm = latents.new_tensor(0.0)
+        generator_delta_diffusion_norm = latents.new_tensor(0.0)
+        generator_delta_tilt_abs_mean = latents.new_tensor(0.0)
+        generator_delta_budget = latents.new_tensor(0.0)
+    else:
+        generator_base_trace = base_generator.trace().mean()
+        generator_delta_trace = conditional_delta.trace().abs().mean()
+        generator_delta_drift_norm = conditional_delta.drift.square().mean().sqrt()
+        generator_delta_diffusion_norm = conditional_delta.diffusion_matrix.square().mean().sqrt()
+        generator_delta_tilt_abs_mean = conditional_delta.log_tilt.abs().mean()
+        generator_delta_budget = conditional_delta.drift.square().mean() + conditional_delta.diffusion_matrix.square().mean()
 
     return {
         "local_drift": drift_loss,
@@ -1292,6 +2257,7 @@ def local_measure_loss(
         "tangent_projector_trace": tangent_diag["tangent_projector_trace"],
         "tangent_spectrum_alignment": tangent_spectrum_alignment,
         "tangent_shape_alignment": tangent_shape_alignment,
+        "tangent_nontriviality": tangent_nontriviality,
         "tangent_anisotropy_gap": tangent_anisotropy_gap,
         "pred_tangent_effective_rank": pred_tangent_effective_rank,
         "target_tangent_effective_rank": target_tangent_effective_rank,
@@ -1299,13 +2265,26 @@ def local_measure_loss(
         "target_tangent_anisotropy": target_tangent_anisotropy,
         "pred_tangent_trace": pred_tangent_trace,
         "target_tangent_trace": target_tangent_trace,
-        "response_operator_trace": target_bundle["response_operator_trace"],
-        "response_operator_effective_rank": target_bundle["response_operator_effective_rank"],
-        "response_operator_anisotropy": target_bundle["response_operator_anisotropy"],
-        "response_operator_asymmetry": target_bundle["response_operator_asymmetry"],
-        "response_identifiable_effective_rank": target_bundle["response_identifiable_effective_rank"],
-        "response_identifiable_anisotropy": target_bundle["response_identifiable_anisotropy"],
-        "response_drift_alignment": target_bundle["response_drift_alignment"],
+        "pred_tangent_spectral_gap": pred_tangent_spectral_gap,
+        "target_tangent_spectral_gap": target_tangent_spectral_gap,
+        "response_operator_trace": target_bundle.response_operator_trace,
+        "response_operator_effective_rank": target_bundle.response_operator_effective_rank,
+        "response_operator_anisotropy": target_bundle.response_operator_anisotropy,
+        "response_operator_asymmetry": target_bundle.response_operator_asymmetry,
+        "response_identifiable_effective_rank": target_bundle.response_identifiable_effective_rank,
+        "response_identifiable_anisotropy": target_bundle.response_identifiable_anisotropy,
+        "response_drift_alignment": target_bundle.response_drift_alignment,
+        "measure_tilt_overreach": measure_tilt_overreach,
+        "generator_base_trace": generator_base_trace,
+        "generator_delta_trace": generator_delta_trace,
+        "generator_delta_drift_norm": generator_delta_drift_norm,
+        "generator_delta_diffusion_norm": generator_delta_diffusion_norm,
+        "generator_delta_tilt_abs_mean": generator_delta_tilt_abs_mean,
+        "generator_delta_budget": generator_delta_budget,
+        "response_geometry_pool_size": target_bundle.geometry_neighbor_pool_size,
+        "response_geometry_reference_pool_size": target_bundle.geometry_reference_pool_size,
+        "response_geometry_reference_neighbor_ratio": target_bundle.geometry_reference_neighbor_ratio,
+        "response_smoothness_pool_size": smoothness_pool_size,
     }
 
 

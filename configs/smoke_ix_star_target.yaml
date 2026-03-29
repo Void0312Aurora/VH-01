@@ -1,0 +1,88 @@
+seed: 7
+output_dir: runs/smoke_ix_star_target
+
+data:
+  kind: synthetic
+  synthetic_mode: coupled
+  train_size: 96
+  val_size: 24
+  seq_len: 6
+  image_size: 32
+  channels: 3
+  num_workers: 0
+
+model:
+  latent_dim: 24
+  cond_dim: 24
+  hidden_dim: 48
+  base_channels: 12
+  chart_hidden_dim: 48
+  response_context_dim: 12
+  response_signature_mode: descriptor_span_stats
+  tangent_dim: 4
+  local_measure_hidden_dim: 48
+  local_measure_rank: 4
+  local_measure_eps: 0.0001
+  local_diffusion_geometry_mode: tangent
+  measure_density_mode: tilted
+
+train:
+  batch_size: 8
+  epochs: 1
+  lr: 0.0003
+  weight_decay: 0.00001
+  amp: false
+  log_every: 2
+  sample_every: 1
+  gradient_clip_norm: 1.0
+  device: auto
+  stage1_epochs: 0
+  stage2_epochs: 0
+  stage3_epochs: 0
+  measure_target_ema_decay: 0.99
+  measure_target_use_teacher_eval: true
+
+loss:
+  base_weight: 1.0
+  rep_weight: 0.05
+  loc_weight: 0.02
+  loc_eps: 0.01
+  dyn_weight: 0.5
+  cond_weight: 0.25
+  reg_weight: 0.01
+  gap_weight: 0.25
+  condition_dyn_weight: 0.5
+  delta_reg_weight: 0.5
+  delta_temporal_weight: 0.5
+  hard_negative_prob: 0.75
+  max_negative_edits: 2
+  local_drift_weight: 0.10
+  local_diffusion_weight: 0.05
+  measure_stationarity_weight: 0.02
+  measure_trace_weight: 0.02
+  response_smoothness_weight: 0.02
+  tangent_projection_weight: 0.02
+  tangent_compatibility_weight: 0.02
+  tangent_spectrum_weight: 0.02
+  tangent_shape_weight: 0.02
+  measure_tilt_target_weight: 0.01
+  response_signature_knn: 2
+  response_signature_temperature: 0.5
+  response_geometry_knn: 3
+  response_geometry_temperature: 0.5
+  response_neighborhood_bank_size: 32
+  response_jet_ridge: 0.001
+  response_jet_center_weight: 1.0
+  response_tau_ridge: 0.001
+  response_tau_mean_penalty: 1.0
+  response_tau_drift_scale: 0.0
+  measure_density_temperature: 1.0
+  measure_test_num_directions: 4
+  measure_trig_scale: 1.0
+  diffusion_target_mode: full
+  measure_target_mode: response_invariant_bootstrap
+  measure_target_blend: 1.0
+  drift_target_mode: response_jet
+  drift_target_blend: 1.0
+  tilt_target_mode: response_support
+  tilt_target_blend: 1.0

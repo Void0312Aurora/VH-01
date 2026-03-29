@@ -103,6 +103,174 @@ class ForwardOutput:
     cond_embed: torch.Tensor
 
 
+@dataclass
+class BaseMeasure:
+    state: torch.Tensor
+    log_base_density: torch.Tensor
+
+
+@dataclass
+class ConditionalTilt:
+    cond_embed: torch.Tensor
+    log_tilt: torch.Tensor
+
+
+@dataclass
+class ConditionalMeasure:
+    base_measure: BaseMeasure
+    conditional_tilt: ConditionalTilt
+    log_total_density: torch.Tensor
+
+    @property
+    def state(self) -> torch.Tensor:
+        return self.base_measure.state
+
+    @property
+    def log_base_density(self) -> torch.Tensor:
+        return self.base_measure.log_base_density
+
+    @property
+    def log_tilt(self) -> torch.Tensor:
+        return self.conditional_tilt.log_tilt
+
+    def normalized_weights(self, temperature: float = 1.0) -> torch.Tensor:
+        if temperature <= 0.0:
+            raise ValueError(f"temperature must be positive, got {temperature}")
+        log_weights = self.log_total_density.squeeze(-1)
+        return torch.softmax(log_weights / temperature, dim=-1)
+
+
+@dataclass
+class BaseGeneratorContext:
+    state: torch.Tensor
+    response_context: torch.Tensor | None
+    tangent_structure: dict[str, torch.Tensor] | None
+    base_measure: BaseMeasure
+
+
+@dataclass
+class BaseLocalGenerator:
+    context: BaseGeneratorContext
+    drift: torch.Tensor
+    diffusion_matrix: torch.Tensor
+    tangent_core_cov: torch.Tensor | None = None
+
+    @property
+    def state(self) -> torch.Tensor:
+        return self.context.state
+
+    @property
+    def response_context(self) -> torch.Tensor | None:
+        return self.context.response_context
+
+    @property
+    def tangent_structure(self) -> dict[str, torch.Tensor] | None:
+        return self.context.tangent_structure
+
+    @property
+    def base_measure(self) -> BaseMeasure:
+        return self.context.base_measure
+
+    def trace(self) -> torch.Tensor:
+        return self.diffusion_matrix.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+
+
+@dataclass
+class ConditionalGeneratorDelta:
+    cond_embed: torch.Tensor
+    conditional_tilt: ConditionalTilt
+    drift: torch.Tensor
+    diffusion_matrix: torch.Tensor
+    tangent_core_cov: torch.Tensor | None = None
+
+    @property
+    def log_tilt(self) -> torch.Tensor:
+        return self.conditional_tilt.log_tilt
+
+    def trace(self) -> torch.Tensor:
+        return self.diffusion_matrix.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+
+
+@dataclass
+class GeneratorContext:
+    state: torch.Tensor
+    cond_embed: torch.Tensor
+    response_context: torch.Tensor | None
+    tangent_structure: dict[str, torch.Tensor] | None
+    conditional_measure: ConditionalMeasure
+
+
+@dataclass
+class LocalGenerator:
+    context: GeneratorContext
+    drift: torch.Tensor
+    diffusion_matrix: torch.Tensor
+    tangent_core_cov: torch.Tensor | None = None
+    base_generator: BaseLocalGenerator | None = None
+    conditional_delta: ConditionalGeneratorDelta | None = None
+
+    @property
+    def state(self) -> torch.Tensor:
+        return self.context.state
+
+    @property
+    def cond_embed(self) -> torch.Tensor:
+        return self.context.cond_embed
+
+    @property
+    def response_context(self) -> torch.Tensor | None:
+        return self.context.response_context
+
+    @property
+    def tangent_structure(self) -> dict[str, torch.Tensor] | None:
+        return self.context.tangent_structure
+
+    @property
+    def conditional_measure(self) -> ConditionalMeasure:
+        return self.context.conditional_measure
+
+    @property
+    def tangent_projector(self) -> torch.Tensor | None:
+        if self.tangent_structure is None:
+            return None
+        return self.tangent_structure["projector"]
+
+    @property
+    def base_measure(self) -> BaseMeasure:
+        if self.base_generator is not None:
+            return self.base_generator.base_measure
+        return self.conditional_measure.base_measure
+
+    def density_weights(self, temperature: float = 1.0) -> torch.Tensor:
+        return self.conditional_measure.normalized_weights(temperature=temperature)
+
+    def trace(self) -> torch.Tensor:
+        return self.diffusion_matrix.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
+
+    def apply_linear(self, directions: torch.Tensor) -> torch.Tensor:
+        return self.drift @ directions.T
+
+    def apply_quadratic(self, directions: torch.Tensor) -> torch.Tensor:
+        projected_state = self.state @ directions.T
+        projected_drift = self.apply_linear(directions)
+        projected_diffusion = torch.einsum("bde,kd,ke->bk", self.diffusion_matrix, directions, directions)
+        return 2.0 * projected_state * projected_drift + projected_diffusion
+
+    def apply_trig(self, directions: torch.Tensor, trig_scale: float) -> torch.Tensor:
+        trig_scale = max(trig_scale, 1e-4)
+        projected_state = self.state @ directions.T
+        projected_drift = self.apply_linear(directions)
+        projected_diffusion = torch.einsum("bde,kd,ke->bk", self.diffusion_matrix, directions, directions)
+        return (
+            trig_scale * torch.cos(trig_scale * projected_state) * projected_drift
+            - 0.5 * (trig_scale**2) * torch.sin(trig_scale * projected_state) * projected_diffusion
+        )
+
+    def apply_radial(self) -> torch.Tensor:
+        diffusion_diag = self.diffusion_matrix.diagonal(dim1=-2, dim2=-1)
+        return 2.0 * (self.state * self.drift).sum(dim=1) + diffusion_diag.sum(dim=1)
+
+
 class VideoDynamicsMVP(nn.Module):
     def __init__(
         self,
@@ -123,6 +291,9 @@ class VideoDynamicsMVP(nn.Module):
         chart_residual_scale: float = 0.1,
         chart_temporal_hidden_dim: int = 128,
         chart_temporal_kernel_size: int = 3,
+        encoder_condition_mode: str = "residual_temporal",
+        encoder_condition_hidden_dim: int = 128,
+        encoder_condition_scale: float = 0.1,
         state_cov_proj_dim: int = 0,
         response_signature_dim: int = 0,
         response_context_dim: int = 0,
@@ -140,6 +311,8 @@ class VideoDynamicsMVP(nn.Module):
             raise ValueError(f"Unsupported condition_score_mode: {condition_score_mode}")
         if chart_mode not in {"pointwise_residual", "temporal_residual", "gated_temporal"}:
             raise ValueError(f"Unsupported chart_mode: {chart_mode}")
+        if encoder_condition_mode not in {"none", "residual_temporal"}:
+            raise ValueError(f"Unsupported encoder_condition_mode: {encoder_condition_mode}")
         if local_diffusion_mode not in {"legacy", "trace_scaled"}:
             raise ValueError(f"Unsupported local_diffusion_mode: {local_diffusion_mode}")
         if local_diffusion_geometry_mode not in {"ambient", "tangent"}:
@@ -155,6 +328,7 @@ class VideoDynamicsMVP(nn.Module):
         if local_diffusion_geometry_mode == "tangent" and tangent_dim <= 0:
             raise ValueError("tangent_dim must be positive when local_diffusion_geometry_mode='tangent'")
         self.latent_dim = latent_dim
+        self.cond_dim = cond_dim
         self.condition_score_mode = condition_score_mode
         self.identity_num_classes = identity_num_classes
         self.semantic_num_classes = semantic_num_classes
@@ -162,6 +336,8 @@ class VideoDynamicsMVP(nn.Module):
         self.chart_num_experts = chart_num_experts
         self.chart_mode = chart_mode
         self.chart_residual_scale = chart_residual_scale
+        self.encoder_condition_mode = encoder_condition_mode
+        self.encoder_condition_scale = encoder_condition_scale
         self.state_cov_proj_dim = state_cov_proj_dim
         self.response_context_dim = response_context_dim
         self.tangent_dim = tangent_dim
@@ -177,12 +353,67 @@ class VideoDynamicsMVP(nn.Module):
         self.base_dynamics = DynamicsMLP(latent_dim, hidden_dim, latent_dim)
         self.cond_delta = DynamicsMLP(latent_dim + cond_dim, hidden_dim, latent_dim)
         self.cond_projection = nn.Linear(cond_dim, latent_dim)
+        temporal_padding = chart_temporal_kernel_size // 2
+        if encoder_condition_mode == "residual_temporal":
+            self.encoder_condition_temporal_net = nn.Sequential(
+                nn.Conv1d(
+                    latent_dim + cond_dim,
+                    encoder_condition_hidden_dim,
+                    kernel_size=chart_temporal_kernel_size,
+                    padding=temporal_padding,
+                ),
+                nn.SiLU(),
+                nn.Conv1d(
+                    encoder_condition_hidden_dim,
+                    encoder_condition_hidden_dim,
+                    kernel_size=chart_temporal_kernel_size,
+                    padding=temporal_padding,
+                ),
+                nn.SiLU(),
+                nn.Conv1d(encoder_condition_hidden_dim, latent_dim, kernel_size=1),
+            )
+            self.encoder_condition_gate_head = nn.Sequential(
+                nn.Linear(latent_dim + cond_dim, encoder_condition_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(encoder_condition_hidden_dim, latent_dim),
+            )
+            self.encoder_condition_bias_head = nn.Sequential(
+                nn.Linear(cond_dim, encoder_condition_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(encoder_condition_hidden_dim, latent_dim),
+            )
+        else:
+            self.encoder_condition_temporal_net = None
+            self.encoder_condition_gate_head = None
+            self.encoder_condition_bias_head = None
         if state_cov_proj_dim > 0:
             self.state_cov_proj = nn.Linear(latent_dim, state_cov_proj_dim, bias=False)
-            state_feature_dim = latent_dim * 5 + state_cov_proj_dim * state_cov_proj_dim
+            summary_feature_dim = latent_dim * 5 + state_cov_proj_dim * state_cov_proj_dim
         else:
             self.state_cov_proj = None
-            state_feature_dim = latent_dim * 5
+            summary_feature_dim = latent_dim * 5
+        trajectory_point_feature_dim = chart_hidden_dim * 2 + latent_dim * 3
+        self.trajectory_point_temporal_net = nn.Sequential(
+            nn.Conv1d(
+                latent_dim,
+                chart_hidden_dim,
+                kernel_size=chart_temporal_kernel_size,
+                padding=temporal_padding,
+            ),
+            nn.SiLU(),
+            nn.Conv1d(
+                chart_hidden_dim,
+                chart_hidden_dim,
+                kernel_size=chart_temporal_kernel_size,
+                padding=temporal_padding,
+            ),
+            nn.SiLU(),
+        )
+        self.trajectory_point_head = _make_two_layer_head(
+            trajectory_point_feature_dim,
+            chart_hidden_dim,
+            latent_dim,
+        )
         if response_context_dim > 0:
             if response_signature_dim <= 0:
                 raise ValueError("response_signature_dim must be positive when response_context_dim > 0")
@@ -195,23 +426,23 @@ class VideoDynamicsMVP(nn.Module):
             self.response_context_head = None
         if tangent_dim > 0:
             self.tangent_frame_head = _make_two_layer_head(
-                state_feature_dim,
+                latent_dim * 2,
                 local_measure_hidden_dim,
                 latent_dim * tangent_dim,
             )
         else:
             self.tangent_frame_head = None
         if chart_num_experts == 1:
-            self.chart_state_head = _make_two_layer_head(state_feature_dim, chart_hidden_dim, latent_dim)
+            self.chart_state_head = _make_two_layer_head(summary_feature_dim, chart_hidden_dim, latent_dim)
             self.chart_state_experts = None
             self.chart_state_gate_head = None
         else:
             self.chart_state_head = None
             self.chart_state_experts = nn.ModuleList(
-                _make_two_layer_head(state_feature_dim, chart_hidden_dim, latent_dim) for _ in range(chart_num_experts)
+                _make_two_layer_head(summary_feature_dim, chart_hidden_dim, latent_dim) for _ in range(chart_num_experts)
             )
             self.chart_state_gate_head = nn.Sequential(
-                nn.Linear(state_feature_dim, chart_hidden_dim),
+                nn.Linear(summary_feature_dim, chart_hidden_dim),
                 nn.SiLU(),
                 nn.Linear(chart_hidden_dim, chart_num_experts),
             )
@@ -220,7 +451,6 @@ class VideoDynamicsMVP(nn.Module):
             nn.SiLU(),
             nn.Linear(chart_hidden_dim, latent_dim),
         )
-        temporal_padding = chart_temporal_kernel_size // 2
         self.chart_temporal_net = nn.Sequential(
             nn.Conv1d(latent_dim, chart_temporal_hidden_dim, kernel_size=chart_temporal_kernel_size, padding=temporal_padding),
             nn.SiLU(),
@@ -290,11 +520,46 @@ class VideoDynamicsMVP(nn.Module):
         else:
             self.register_parameter("semantic_prototypes", None)
 
-    def encode_video(self, video: torch.Tensor) -> torch.Tensor:
+    def _encode_video_base(self, video: torch.Tensor) -> torch.Tensor:
         batch, steps, channels, height, width = video.shape
         flat = video.view(batch * steps, channels, height, width)
         latents = self.frame_encoder(flat)
         return latents.view(batch, steps, self.latent_dim)
+
+    def _encode_video_with_condition(
+        self,
+        base_latents: torch.Tensor,
+        cond_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.encoder_condition_mode == "none":
+            return base_latents
+        if (
+            self.encoder_condition_temporal_net is None
+            or self.encoder_condition_gate_head is None
+            or self.encoder_condition_bias_head is None
+        ):
+            raise RuntimeError("Conditional encoder modules are unexpectedly missing.")
+        batch, steps, _ = base_latents.shape
+        cond_seq = cond_embed.unsqueeze(1).expand(batch, steps, cond_embed.size(-1))
+        temporal_input = torch.cat([base_latents, cond_seq], dim=-1).transpose(1, 2)
+        residual = self.encoder_condition_temporal_net(temporal_input).transpose(1, 2)
+        gate = torch.sigmoid(
+            self.encoder_condition_gate_head(
+                torch.cat([base_latents, cond_seq], dim=-1).reshape(batch * steps, -1)
+            )
+        ).view(batch, steps, self.latent_dim)
+        cond_bias = self.encoder_condition_bias_head(cond_embed).unsqueeze(1)
+        return base_latents + self.encoder_condition_scale * gate * (residual + cond_bias)
+
+    def encode_video(
+        self,
+        video: torch.Tensor,
+        cond_embed: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        base_latents = self._encode_video_base(video)
+        if cond_embed is None:
+            return base_latents
+        return self._encode_video_with_condition(base_latents, cond_embed)
 
     def decode_video(self, latents: torch.Tensor, cond_embed: torch.Tensor) -> torch.Tensor:
         batch, steps, latent_dim = latents.shape
@@ -306,7 +571,7 @@ class VideoDynamicsMVP(nn.Module):
 
     def forward(self, video: torch.Tensor, condition: torch.Tensor) -> ForwardOutput:
         cond_embed = self.condition_encoder(condition)
-        latents = self.encode_video(video)
+        latents = self.encode_video(video, cond_embed=cond_embed)
         recon = self.decode_video(latents, cond_embed)
         return ForwardOutput(recon=recon, latents=latents, cond_embed=cond_embed)
 
@@ -433,23 +698,61 @@ class VideoDynamicsMVP(nn.Module):
         aux["chart_expert_max_weight"] = gate.max(dim=-1).values.mean()
         return torch.einsum("be,bed->bd", gate, expert_outputs), aux
 
-    def trajectory_state(self, latents: torch.Tensor) -> torch.Tensor:
-        features = self._trajectory_state_features(latents)
-        state, _ = self._trajectory_state_from_features(features)
-        return state
+    def _trajectory_point_features(self, latents: torch.Tensor) -> torch.Tensor:
+        chart_latents = self.chart_latents(latents)
+        temporal_features = self.trajectory_point_temporal_net(chart_latents.transpose(1, 2))
+        temporal_mean = temporal_features.mean(dim=-1)
+        temporal_max = temporal_features.amax(dim=-1)
+        start = chart_latents[:, 0]
+        end = chart_latents[:, -1]
+        summary = chart_latents.mean(dim=1)
+        return torch.cat([temporal_mean, temporal_max, start, end, summary], dim=-1)
 
-    def trajectory_state_diagnostics(self, latents: torch.Tensor) -> dict[str, torch.Tensor]:
+    def trajectory_point(self, latents: torch.Tensor) -> torch.Tensor:
+        features = self._trajectory_point_features(latents)
+        return self.trajectory_point_head(features)
+
+    def trajectory_point_diagnostics(self, latents: torch.Tensor) -> dict[str, torch.Tensor]:
+        point = self.trajectory_point(latents)
+        return {
+            "trajectory_point_norm": point.norm(dim=-1).mean(),
+            "trajectory_point_std": point.std(dim=0, unbiased=False).mean(),
+        }
+
+    def trajectory_summary_context(self, latents: torch.Tensor) -> torch.Tensor:
+        features = self._trajectory_state_features(latents)
+        summary_context, _ = self._trajectory_state_from_features(features)
+        return summary_context
+
+    def trajectory_summary_diagnostics(self, latents: torch.Tensor) -> dict[str, torch.Tensor]:
         features = self._trajectory_state_features(latents)
         _, aux = self._trajectory_state_from_features(features)
+        return aux
+
+    def trajectory_state(self, latents: torch.Tensor) -> torch.Tensor:
+        # Compatibility alias: active geometry paths now treat the trajectory point
+        # as the default state anchor rather than the summary-only context.
+        return self.trajectory_point(latents)
+
+    def trajectory_state_diagnostics(self, latents: torch.Tensor) -> dict[str, torch.Tensor]:
+        aux = self.trajectory_summary_diagnostics(latents)
+        aux.update(self.trajectory_point_diagnostics(latents))
         return aux
 
     def trajectory_tangent_frame(
         self,
         latents: torch.Tensor,
+        *,
+        point: torch.Tensor | None = None,
+        summary_context: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         if self.tangent_frame_head is None:
             return None
-        features = self._trajectory_state_features(latents)
+        if point is None:
+            point = self.trajectory_point(latents)
+        if summary_context is None:
+            summary_context = self.trajectory_summary_context(latents)
+        features = torch.cat([point, summary_context], dim=-1)
         raw_frame = self.tangent_frame_head(features).view(latents.size(0), self.latent_dim, self.tangent_dim)
         frame, _ = torch.linalg.qr(raw_frame.float(), mode="reduced")
         return frame[:, :, : self.tangent_dim].to(dtype=raw_frame.dtype)
@@ -488,7 +791,8 @@ class VideoDynamicsMVP(nn.Module):
     ) -> dict[str, torch.Tensor] | None:
         if self.local_diffusion_geometry_mode != "tangent":
             return None
-        frame = self.trajectory_tangent_frame(latents)
+        point = state if state is not None else self.trajectory_point(latents)
+        frame = self.trajectory_tangent_frame(latents, point=point)
         if frame is None:
             raise RuntimeError("Tangent frame is required for tangent-geometry diffusion mode.")
         context = self.local_diffusion_context(
@@ -524,7 +828,7 @@ class VideoDynamicsMVP(nn.Module):
         include_condition: bool = True,
     ) -> torch.Tensor:
         if state is None:
-            state = self.trajectory_state(latents)
+            state = self.trajectory_point(latents)
         if not include_condition:
             return state
         return torch.cat([state, cond_embed], dim=-1)
@@ -548,10 +852,26 @@ class VideoDynamicsMVP(nn.Module):
         return torch.cat([context, response_features], dim=-1)
 
     def step_dynamics(self, z: torch.Tensor, cond_embed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        base = self.base_dynamics(z)
-        delta = self.cond_delta(torch.cat([z, cond_embed], dim=-1))
-        next_z = z + base + delta
+        next_base, _ = self.base_step_dynamics(z)
+        delta = self.conditional_step_delta(z, cond_embed)
+        next_z = next_base + delta
         return next_z, delta
+
+    def zero_cond_embed(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return torch.zeros(batch_size, self.cond_dim, device=device, dtype=dtype)
+
+    def base_step_dynamics(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        base = self.base_dynamics(z)
+        return z + base, base
+
+    def conditional_step_delta(self, z: torch.Tensor, cond_embed: torch.Tensor) -> torch.Tensor:
+        return self.cond_delta(torch.cat([z, cond_embed], dim=-1))
 
     def rollout_from(
         self,
@@ -573,14 +893,36 @@ class VideoDynamicsMVP(nn.Module):
         latents: torch.Tensor,
         cond_embed: torch.Tensor,
     ) -> torch.Tensor:
+        return self.trajectory_base_drift(latents) + self.trajectory_conditional_drift_delta(latents, cond_embed)
+
+    def trajectory_base_drift(
+        self,
+        latents: torch.Tensor,
+    ) -> torch.Tensor:
+        if latents.size(1) < 2:
+            return torch.zeros(latents.size(0), latents.size(-1), device=latents.device, dtype=latents.dtype)
+        current = latents[:, :-1].reshape(-1, latents.size(-1))
+        current_chart = self.chart_latents(current.unsqueeze(1)).squeeze(1)
+        pred_next, _ = self.base_step_dynamics(current)
+        pred_next_chart = self.chart_latents(pred_next.unsqueeze(1)).squeeze(1)
+        drift = (pred_next_chart - current_chart).view(latents.size(0), latents.size(1) - 1, latents.size(-1))
+        return drift.mean(dim=1)
+
+    def trajectory_conditional_drift_delta(
+        self,
+        latents: torch.Tensor,
+        cond_embed: torch.Tensor,
+    ) -> torch.Tensor:
         if latents.size(1) < 2:
             return torch.zeros(latents.size(0), latents.size(-1), device=latents.device, dtype=latents.dtype)
         current = latents[:, :-1].reshape(-1, latents.size(-1))
         cond_seq = cond_embed.unsqueeze(1).expand(-1, latents.size(1) - 1, -1).reshape(-1, cond_embed.size(-1))
-        pred_next, _ = self.step_dynamics(current, cond_seq)
-        current_chart = self.chart_latents(current.unsqueeze(1)).squeeze(1)
-        pred_next_chart = self.chart_latents(pred_next.unsqueeze(1)).squeeze(1)
-        drift = (pred_next_chart - current_chart).view(latents.size(0), latents.size(1) - 1, latents.size(-1))
+        base_next, _ = self.base_step_dynamics(current)
+        cond_delta = self.conditional_step_delta(current, cond_seq)
+        full_next = base_next + cond_delta
+        base_next_chart = self.chart_latents(base_next.unsqueeze(1)).squeeze(1)
+        full_next_chart = self.chart_latents(full_next.unsqueeze(1)).squeeze(1)
+        drift = (full_next_chart - base_next_chart).view(latents.size(0), latents.size(1) - 1, latents.size(-1))
         return drift.mean(dim=1)
 
     def local_diffusion_factor(
@@ -695,6 +1037,174 @@ class VideoDynamicsMVP(nn.Module):
         )
         return diffusion.diagonal(dim1=-2, dim2=-1)
 
+    def base_measure(
+        self,
+        latents: torch.Tensor,
+        *,
+        state: torch.Tensor | None = None,
+        cond_embed: torch.Tensor | None = None,
+    ) -> BaseMeasure:
+        if state is None:
+            state = self.trajectory_point(latents)
+        if self.measure_density_mode == "joint":
+            if cond_embed is None:
+                cond_embed = self.zero_cond_embed(state.size(0), device=state.device, dtype=state.dtype)
+            if self.measure_log_density_head is None:
+                raise RuntimeError("measure_log_density_head is unexpectedly missing.")
+            joint_context = self.local_measure_context(latents, cond_embed, state=state, include_condition=True)
+            log_base_density = self.measure_log_density_head(joint_context)
+        else:
+            if self.measure_base_log_density_head is None:
+                raise RuntimeError("measure_base_log_density_head is unexpectedly missing.")
+            log_base_density = self.measure_base_log_density_head(state)
+        return BaseMeasure(
+            state=state,
+            log_base_density=log_base_density,
+        )
+
+    def conditional_tilt(
+        self,
+        latents: torch.Tensor,
+        cond_embed: torch.Tensor,
+        *,
+        state: torch.Tensor | None = None,
+    ) -> ConditionalTilt:
+        if state is None:
+            state = self.trajectory_point(latents)
+        zero = state.new_zeros(state.size(0), 1)
+        if self.measure_density_mode == "joint":
+            if self.measure_log_density_head is None:
+                raise RuntimeError("measure_log_density_head is unexpectedly missing.")
+            zero_cond_embed = torch.zeros_like(cond_embed)
+            full_context = self.local_measure_context(latents, cond_embed, state=state, include_condition=True)
+            base_context = self.local_measure_context(latents, zero_cond_embed, state=state, include_condition=True)
+            log_tilt = self.measure_log_density_head(full_context) - self.measure_log_density_head(base_context)
+        else:
+            if self.measure_tilt_head is None:
+                raise RuntimeError("measure_tilt_head is unexpectedly missing.")
+            tilt_context = self.local_measure_context(latents, cond_embed, state=state, include_condition=True)
+            log_tilt = self.measure_tilt_head(tilt_context)
+        return ConditionalTilt(
+            cond_embed=cond_embed,
+            log_tilt=log_tilt,
+        )
+
+    def conditional_measure(
+        self,
+        latents: torch.Tensor,
+        cond_embed: torch.Tensor,
+        *,
+        state: torch.Tensor | None = None,
+    ) -> ConditionalMeasure:
+        if state is None:
+            state = self.trajectory_point(latents)
+        base_measure = self.base_measure(latents, state=state, cond_embed=cond_embed)
+        conditional_tilt = self.conditional_tilt(latents, cond_embed, state=state)
+        return ConditionalMeasure(
+            base_measure=base_measure,
+            conditional_tilt=conditional_tilt,
+            log_total_density=base_measure.log_base_density + conditional_tilt.log_tilt,
+        )
+
+    def local_generator(
+        self,
+        latents: torch.Tensor,
+        cond_embed: torch.Tensor,
+        response_context: torch.Tensor | None = None,
+        *,
+        state: torch.Tensor | None = None,
+    ) -> LocalGenerator:
+        if state is None:
+            state = self.trajectory_point(latents)
+        zero_cond_embed = torch.zeros_like(cond_embed)
+        base_measure = self.base_measure(latents, state=state, cond_embed=zero_cond_embed)
+        conditional_tilt = self.conditional_tilt(latents, cond_embed, state=state)
+        conditional_measure = ConditionalMeasure(
+            base_measure=base_measure,
+            conditional_tilt=conditional_tilt,
+            log_total_density=base_measure.log_base_density + conditional_tilt.log_tilt,
+        )
+        tangent_structure = self.local_tangent_structure(
+            latents,
+            cond_embed,
+            response_context=response_context,
+            state=state,
+        )
+        base_tangent_structure = self.local_tangent_structure(
+            latents,
+            zero_cond_embed,
+            response_context=response_context,
+            state=state,
+        )
+        diffusion_matrix = self.local_diffusion_matrix(
+            latents,
+            cond_embed,
+            response_context=response_context,
+            state=state,
+            tangent_structure=tangent_structure,
+        )
+        base_diffusion_matrix = self.local_diffusion_matrix(
+            latents,
+            zero_cond_embed,
+            response_context=response_context,
+            state=state,
+            tangent_structure=base_tangent_structure,
+        )
+        tangent_core_cov = self.local_tangent_covariance(
+            latents,
+            cond_embed,
+            response_context=response_context,
+            state=state,
+            tangent_structure=tangent_structure,
+        )
+        base_tangent_core_cov = self.local_tangent_covariance(
+            latents,
+            zero_cond_embed,
+            response_context=response_context,
+            state=state,
+            tangent_structure=base_tangent_structure,
+        )
+        base_drift = self.trajectory_base_drift(latents)
+        conditional_drift_delta = self.trajectory_conditional_drift_delta(latents, cond_embed)
+        context = GeneratorContext(
+            state=state,
+            cond_embed=cond_embed,
+            response_context=response_context,
+            tangent_structure=tangent_structure,
+            conditional_measure=conditional_measure,
+        )
+        base_context = BaseGeneratorContext(
+            state=state,
+            response_context=response_context,
+            tangent_structure=base_tangent_structure,
+            base_measure=base_measure,
+        )
+        base_generator = BaseLocalGenerator(
+            context=base_context,
+            drift=base_drift,
+            diffusion_matrix=base_diffusion_matrix,
+            tangent_core_cov=base_tangent_core_cov,
+        )
+        conditional_delta = ConditionalGeneratorDelta(
+            cond_embed=cond_embed,
+            conditional_tilt=conditional_tilt,
+            drift=conditional_drift_delta,
+            diffusion_matrix=diffusion_matrix - base_diffusion_matrix,
+            tangent_core_cov=(
+                None
+                if tangent_core_cov is None or base_tangent_core_cov is None
+                else tangent_core_cov - base_tangent_core_cov
+            ),
+        )
+        return LocalGenerator(
+            context=context,
+            drift=base_drift + conditional_drift_delta,
+            diffusion_matrix=diffusion_matrix,
+            tangent_core_cov=tangent_core_cov,
+            base_generator=base_generator,
+            conditional_delta=conditional_delta,
+        )
+
     def measure_log_density_components(
         self,
         latents: torch.Tensor,
@@ -702,21 +1212,8 @@ class VideoDynamicsMVP(nn.Module):
         *,
         state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if state is None:
-            state = self.trajectory_state(latents)
-        zero = state.new_zeros(state.size(0), 1)
-        if self.measure_density_mode == "joint":
-            if self.measure_log_density_head is None:
-                raise RuntimeError("measure_log_density_head is unexpectedly missing.")
-            joint_context = self.local_measure_context(latents, cond_embed, state=state, include_condition=True)
-            total = self.measure_log_density_head(joint_context)
-            return total, zero, total
-        if self.measure_base_log_density_head is None or self.measure_tilt_head is None:
-            raise RuntimeError("Tilted measure density heads are unexpectedly missing.")
-        base = self.measure_base_log_density_head(state)
-        tilt_context = self.local_measure_context(latents, cond_embed, state=state, include_condition=True)
-        tilt = self.measure_tilt_head(tilt_context)
-        return base, tilt, base + tilt
+        measure = self.conditional_measure(latents, cond_embed, state=state)
+        return measure.log_base_density, measure.log_tilt, measure.log_total_density
 
     def measure_log_density(
         self,
@@ -725,8 +1222,7 @@ class VideoDynamicsMVP(nn.Module):
         *,
         state: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        _, _, total = self.measure_log_density_components(latents, cond_embed, state=state)
-        return total
+        return self.conditional_measure(latents, cond_embed, state=state).log_total_density
 
     def condition_alignment_energy(
         self,

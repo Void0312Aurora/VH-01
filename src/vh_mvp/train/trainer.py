@@ -28,9 +28,14 @@ from vh_mvp.data import (
     sample_negative_conditions,
 )
 from vh_mvp.losses import (
+    append_geometry_neighborhood_reference,
+    append_smoothness_neighborhood_reference,
+    build_geometry_neighborhood_reference,
+    build_smoothness_neighborhood_reference,
     classification_accuracy,
     compute_stage_weights,
     dynamics_loss,
+    GeometryNeighborhoodReference,
     gap_loss,
     latent_representation_loss,
     local_measure_loss,
@@ -41,13 +46,13 @@ from vh_mvp.losses import (
     reconstruction_loss,
     regularization_loss,
     response_signature_dim,
+    SmoothnessNeighborhoodReference,
     support_refinement_loss,
 )
 from vh_mvp.models import VideoDynamicsMVP
 from vh_mvp.support import (
-    build_candidate_posterior,
-    candidate_sets_from_posterior,
-    query_responsive_selection,
+    build_condition_inference_posterior,
+    query_measure_execution,
     summarize_condition_distribution,
 )
 
@@ -137,6 +142,18 @@ def build_dataloaders(cfg: AppConfig) -> tuple[DataLoader, DataLoader, object, o
             seq_len=cfg.data.seq_len,
             image_size=cfg.data.image_size,
         )
+        shared_labels = sorted(
+            {
+                sample.label
+                for dataset in (train_ds, val_ds)
+                for sample in dataset.samples
+                if sample.label
+            }
+        )
+        if shared_labels:
+            shared_label_to_idx = {label: idx for idx, label in enumerate(shared_labels)}
+            train_ds.label_to_idx = shared_label_to_idx
+            val_ds.label_to_idx = shared_label_to_idx
     else:
         raise ValueError(f"Unsupported data.kind: {cfg.data.kind}")
     train_loader = DataLoader(
@@ -175,8 +192,15 @@ def build_model(cfg: AppConfig, device: torch.device) -> VideoDynamicsMVP:
         chart_residual_scale=cfg.model.chart_residual_scale,
         chart_temporal_hidden_dim=cfg.model.chart_temporal_hidden_dim,
         chart_temporal_kernel_size=cfg.model.chart_temporal_kernel_size,
+        encoder_condition_mode=cfg.model.encoder_condition_mode,
+        encoder_condition_hidden_dim=cfg.model.encoder_condition_hidden_dim,
+        encoder_condition_scale=cfg.model.encoder_condition_scale,
         state_cov_proj_dim=cfg.model.state_cov_proj_dim,
-        response_signature_dim=response_signature_dim(cfg.data.seq_len, cfg.model.response_signature_mode),
+        response_signature_dim=response_signature_dim(
+            cfg.data.seq_len,
+            cfg.model.response_signature_mode,
+            channels=cfg.data.channels,
+        ),
         response_context_dim=cfg.model.response_context_dim,
         tangent_dim=cfg.model.tangent_dim,
         local_measure_hidden_dim=cfg.model.local_measure_hidden_dim,
@@ -198,6 +222,67 @@ def build_condition_targets(
         return None
     indices = [condition_catalog.index_by_key[condition_tuple_from_tensor(row)] for row in condition]
     return torch.tensor(indices, dtype=torch.long, device=condition.device)
+
+
+def build_condition_label_targets(
+    condition: torch.Tensor,
+    condition_catalog: ConditionCatalog | None,
+) -> torch.Tensor | None:
+    if condition_catalog is None:
+        return None
+    label_indices: list[int] = []
+    for row in condition:
+        catalog_idx = condition_catalog.index_by_key[condition_tuple_from_tensor(row)]
+        label_idx = condition_catalog.label_indices[catalog_idx]
+        if label_idx < 0:
+            return None
+        label_indices.append(label_idx)
+    return torch.tensor(label_indices, dtype=torch.long, device=condition.device)
+
+
+def build_condition_catalog_label_tensor(
+    condition_catalog: ConditionCatalog | None,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if condition_catalog is None or not condition_catalog.label_indices:
+        return None
+    if any(label_idx < 0 for label_idx in condition_catalog.label_indices):
+        return None
+    return torch.tensor(condition_catalog.label_indices, dtype=torch.long, device=device)
+
+
+def compute_condition_catalog_logits(
+    *,
+    model: VideoDynamicsMVP,
+    latents: torch.Tensor,
+    condition_catalog: ConditionCatalog,
+    condition_catalog_tensor: torch.Tensor | None,
+    catalog_readout_mode: str,
+) -> torch.Tensor:
+    if catalog_readout_mode == "semantic_prototype" and model.semantic_prototypes is not None:
+        label_tensor = build_condition_catalog_label_tensor(condition_catalog, latents.device)
+        if label_tensor is not None:
+            return model.semantic_logits(latents).index_select(1, label_tensor)
+    if condition_catalog_tensor is None:
+        raise RuntimeError("Condition catalog tensor is required for model-based condition readout.")
+    return model.condition_candidate_logits(latents, condition_catalog_tensor)
+
+
+def compute_condition_alignment_scores(
+    *,
+    model: VideoDynamicsMVP,
+    latents: torch.Tensor,
+    condition: torch.Tensor,
+    condition_catalog: ConditionCatalog | None,
+    catalog_readout_mode: str,
+) -> torch.Tensor:
+    if catalog_readout_mode == "semantic_prototype" and model.semantic_prototypes is not None:
+        label_targets = build_condition_label_targets(condition, condition_catalog)
+        if label_targets is not None:
+            semantic_logits = model.semantic_logits(latents)
+            return -semantic_logits.gather(1, label_targets.unsqueeze(1)).squeeze(1)
+    cond_embed = model.condition_encoder(condition)
+    return model.condition_alignment_energy(latents, cond_embed)
 
 
 def sample_valid_negative_conditions(
@@ -238,10 +323,17 @@ def compute_condition_logits(
     condition: torch.Tensor,
     condition_catalog: ConditionCatalog | None,
     condition_catalog_tensor: torch.Tensor | None,
+    catalog_readout_mode: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if condition_catalog is None or condition_catalog_tensor is None:
         return model.condition_logits_and_targets(latents, condition)
-    logits = model.condition_candidate_logits(latents, condition_catalog_tensor)
+    logits = compute_condition_catalog_logits(
+        model=model,
+        latents=latents,
+        condition_catalog=condition_catalog,
+        condition_catalog_tensor=condition_catalog_tensor,
+        catalog_readout_mode=catalog_readout_mode,
+    )
     targets = build_condition_targets(condition, condition_catalog)
     if targets is None:
         raise RuntimeError("Condition catalog targets are unexpectedly missing.")
@@ -274,6 +366,7 @@ def evaluate_query_responsive_execution(
     plan_core_alpha: float,
     posterior_temperature: float,
     max_samples: int,
+    catalog_readout_mode: str,
 ) -> dict[str, float]:
     if max_samples <= 0:
         return {
@@ -310,8 +403,14 @@ def evaluate_query_responsive_execution(
         condition = sample["condition"].unsqueeze(0)
 
         latents = model.encode_video(video)
-        obs_logits = model.condition_candidate_logits(latents, candidate_conditions)
-        obs_posterior = build_candidate_posterior(obs_logits, temperature=posterior_temperature)
+        obs_logits = compute_condition_catalog_logits(
+            model=model,
+            latents=latents,
+            condition_catalog=condition_catalog,
+            condition_catalog_tensor=candidate_conditions,
+            catalog_readout_mode=catalog_readout_mode,
+        )
+        obs_posterior = build_condition_inference_posterior(obs_logits, temperature=posterior_temperature)
 
         z_start = latents[:, 0].expand(num_candidates, -1)
         rollout_latents, _ = model.rollout_from(z_start, cond_embed_all, steps=video.size(1) - 1)
@@ -320,21 +419,28 @@ def evaluate_query_responsive_execution(
         future_mse = ((rollout_video - target_future) ** 2).mean(dim=(1, 2, 3, 4))
 
         true_idx = condition_catalog.index_by_key[condition_tuple_from_tensor(condition[0])]
-        query_embed = cond_embed_all[true_idx : true_idx + 1].expand(num_candidates, -1)
-        plan_logits = -model.condition_alignment_energy(rollout_latents, query_embed).unsqueeze(0)
-        plan_posterior = build_candidate_posterior(plan_logits, temperature=posterior_temperature)
-        plan_set = candidate_sets_from_posterior(plan_posterior, [alpha])[alpha]
-        plan_members = plan_set.member_indices()[0]
-        qr_selection = query_responsive_selection(
+        rollout_state = model.trajectory_point(rollout_latents)
+        rollout_log_weights_by_condition: list[torch.Tensor] = []
+        for cond_idx in range(num_candidates):
+            query_embed = cond_embed_all[cond_idx : cond_idx + 1].expand(num_candidates, -1)
+            conditional_measure = model.conditional_measure(
+                rollout_latents,
+                query_embed,
+                state=rollout_state,
+            )
+            rollout_log_weights_by_condition.append(conditional_measure.log_total_density.squeeze(-1))
+        measure_selection = query_measure_execution(
             obs_posterior=obs_posterior,
-            plan_posterior=plan_posterior,
+            rollout_log_weights_by_condition=torch.stack(rollout_log_weights_by_condition, dim=0).unsqueeze(0),
             obs_alpha=obs_alpha,
-            plan_core_alpha=plan_core_alpha,
+            readout_alpha=alpha,
+            temperature=posterior_temperature,
         )
+        plan_members = measure_selection.member_indices()[0]
 
         direct_mse = float(future_mse[true_idx].item())
-        support_top1_mse = float(future_mse[int(plan_posterior.top1_idx[0].item())].item())
-        exec_idx = int(qr_selection.selected_idx[0].item())
+        support_top1_mse = float(future_mse[int(measure_selection.rollout_readout.top1_idx[0].item())].item())
+        exec_idx = int(measure_selection.selected_idx[0].item())
         exec_mse = float(future_mse[exec_idx].item())
         set_best_idx = min(plan_members, key=lambda idx: float(future_mse[idx].item()))
         set_best_mse = float(future_mse[set_best_idx].item())
@@ -345,8 +451,8 @@ def evaluate_query_responsive_execution(
         total_exec_mse += exec_mse
         total_set_best_mse += set_best_mse
         total_oracle_mse += oracle_mse
-        total_exec_set_size += len(qr_selection.member_indices()[0])
-        total_fallback += float(qr_selection.used_plan_core_fallback[0].item())
+        total_exec_set_size += len(measure_selection.member_indices()[0])
+        total_fallback += 0.0
         total_match_true += float(exec_idx == true_idx)
         processed += 1
 
@@ -404,6 +510,47 @@ def compute_query_checkpoint_score(
         "gap_penalty": cfg.train.query_checkpoint_gap_weight * direct_gap,
     }
     return tuple_score, components
+
+
+def compute_measure_checkpoint_score(
+    *,
+    val_metrics: dict[str, float],
+    cfg: AppConfig,
+) -> tuple[float, dict[str, float]]:
+    trace_penalty = 0.25 * val_metrics["measure_trace_alignment"] if cfg.loss.measure_trace_weight > 0.0 else 0.0
+    tilt_penalty = 0.25 * val_metrics["measure_tilt_alignment"] if cfg.loss.measure_tilt_target_weight > 0.0 else 0.0
+    tangent_projection_penalty = 0.25 * val_metrics["tangent_projection"] if cfg.loss.tangent_projection_weight > 0.0 else 0.0
+    tangent_bundle_penalty = 0.25 * val_metrics["tangent_bundle_compatibility"] if cfg.loss.tangent_compatibility_weight > 0.0 else 0.0
+    tangent_spectrum_penalty = 0.02 * val_metrics["tangent_spectrum_alignment"] if cfg.loss.tangent_spectrum_weight > 0.0 else 0.0
+    tangent_shape_penalty = 0.10 * val_metrics["tangent_shape_alignment"] if cfg.loss.tangent_shape_weight > 0.0 else 0.0
+    measure_score = -(
+        val_metrics["measure_stationarity"]
+        + 0.5 * val_metrics["response_smoothness"]
+        + 0.25 * val_metrics["local_drift"]
+        + 0.25 * val_metrics["local_diffusion"]
+        + trace_penalty
+        + tilt_penalty
+        + tangent_projection_penalty
+        + tangent_bundle_penalty
+        + tangent_spectrum_penalty
+        + tangent_shape_penalty
+    )
+    components = {
+        "mode": "measure",
+        "measure_score": measure_score,
+        "measure_stationarity": val_metrics["measure_stationarity"],
+        "measure_trig_stationarity": val_metrics["measure_trig_stationarity"],
+        "measure_trace_alignment": val_metrics["measure_trace_alignment"],
+        "measure_tilt_alignment": val_metrics["measure_tilt_alignment"],
+        "response_smoothness": val_metrics["response_smoothness"],
+        "local_drift": val_metrics["local_drift"],
+        "local_diffusion": val_metrics["local_diffusion"],
+        "tangent_projection": val_metrics["tangent_projection"],
+        "tangent_bundle_compatibility": val_metrics["tangent_bundle_compatibility"],
+        "tangent_spectrum_alignment": val_metrics["tangent_spectrum_alignment"],
+        "tangent_shape_alignment": val_metrics["tangent_shape_alignment"],
+    }
+    return measure_score, components
 
 
 def write_history_csv(path: Path, history: list[dict[str, float]]) -> None:
@@ -547,6 +694,7 @@ def train_one_epoch(
         "tangent_projector_trace": 0.0,
         "tangent_spectrum_alignment": 0.0,
         "tangent_shape_alignment": 0.0,
+        "tangent_nontriviality": 0.0,
         "tangent_anisotropy_gap": 0.0,
         "pred_tangent_effective_rank": 0.0,
         "target_tangent_effective_rank": 0.0,
@@ -554,6 +702,15 @@ def train_one_epoch(
         "target_tangent_anisotropy": 0.0,
         "pred_tangent_trace": 0.0,
         "target_tangent_trace": 0.0,
+        "pred_tangent_spectral_gap": 0.0,
+        "target_tangent_spectral_gap": 0.0,
+        "measure_tilt_overreach": 0.0,
+        "generator_base_trace": 0.0,
+        "generator_delta_trace": 0.0,
+        "generator_delta_drift_norm": 0.0,
+        "generator_delta_diffusion_norm": 0.0,
+        "generator_delta_tilt_abs_mean": 0.0,
+        "generator_delta_budget": 0.0,
         "identity_acc": 0.0,
         "semantic_acc": 0.0,
         "identity_ortho": 0.0,
@@ -567,6 +724,24 @@ def train_one_epoch(
         start_epoch=cfg.train.identity_start_epoch,
         warmup_epochs=cfg.train.identity_warmup_epochs,
     )
+    measure_active = (
+        cfg.loss.local_drift_weight > 0.0
+        or cfg.loss.local_diffusion_weight > 0.0
+        or cfg.loss.measure_stationarity_weight > 0.0
+        or cfg.loss.measure_trace_weight > 0.0
+        or cfg.loss.measure_tilt_target_weight > 0.0
+        or cfg.loss.response_smoothness_weight > 0.0
+        or cfg.loss.tangent_projection_weight > 0.0
+        or cfg.loss.tangent_compatibility_weight > 0.0
+        or cfg.loss.tangent_spectrum_weight > 0.0
+        or cfg.loss.tangent_shape_weight > 0.0
+        or cfg.loss.tangent_nontriviality_weight > 0.0
+        or cfg.loss.measure_tilt_overreach_weight > 0.0
+        or cfg.loss.generator_delta_weight > 0.0
+    )
+    neighborhood_bank_size = max(int(cfg.loss.response_neighborhood_bank_size), 0)
+    geometry_reference: GeometryNeighborhoodReference | None = None
+    smoothness_reference: SmoothnessNeighborhoodReference | None = None
 
     progress = tqdm(loader, desc=f"train {epoch:03d}", leave=False)
     for batch in progress:
@@ -621,15 +796,24 @@ def train_one_epoch(
                 condition=condition,
                 condition_catalog=condition_catalog,
                 condition_catalog_tensor=condition_catalog_tensor,
+                catalog_readout_mode=cfg.train.condition_catalog_readout_mode,
             )
             cond_nce = nce_condition_loss(logits, cond_targets)
             cond_acc = classification_accuracy(logits, cond_targets)
-            cond_dist = summarize_condition_distribution(logits, cond_targets)
+            cond_dist = summarize_condition_distribution(
+                logits,
+                cond_targets,
+                temperature=cfg.train.query_eval_posterior_temperature,
+            )
             support_terms = support_refinement_loss(
                 logits,
                 cond_targets,
+                posterior_temperature=cfg.train.query_eval_posterior_temperature,
                 p_true_floor=cfg.loss.support_p_true_floor,
+                p_true_ceiling=cfg.loss.support_p_true_ceiling,
                 margin_floor=cfg.loss.support_margin_floor,
+                margin_ceiling=cfg.loss.support_margin_ceiling,
+                support_ratio_floor=cfg.loss.support_ratio_floor,
                 support_ratio_ceiling=cfg.loss.support_ratio_ceiling,
                 gate_p_true=cfg.loss.support_gate_p_true,
                 gate_margin=cfg.loss.support_gate_margin,
@@ -668,6 +852,7 @@ def train_one_epoch(
                 "tangent_projector_trace": out.latents.new_tensor(0.0),
                 "tangent_spectrum_alignment": out.latents.new_tensor(0.0),
                 "tangent_shape_alignment": out.latents.new_tensor(0.0),
+                "tangent_nontriviality": out.latents.new_tensor(0.0),
                 "tangent_anisotropy_gap": out.latents.new_tensor(0.0),
                 "pred_tangent_effective_rank": out.latents.new_tensor(0.0),
                 "target_tangent_effective_rank": out.latents.new_tensor(0.0),
@@ -675,20 +860,18 @@ def train_one_epoch(
                 "target_tangent_anisotropy": out.latents.new_tensor(0.0),
                 "pred_tangent_trace": out.latents.new_tensor(0.0),
                 "target_tangent_trace": out.latents.new_tensor(0.0),
+                "pred_tangent_spectral_gap": out.latents.new_tensor(0.0),
+                "target_tangent_spectral_gap": out.latents.new_tensor(0.0),
+                "measure_tilt_overreach": out.latents.new_tensor(0.0),
+                "generator_base_trace": out.latents.new_tensor(0.0),
+                "generator_delta_trace": out.latents.new_tensor(0.0),
+                "generator_delta_drift_norm": out.latents.new_tensor(0.0),
+                "generator_delta_diffusion_norm": out.latents.new_tensor(0.0),
+                "generator_delta_tilt_abs_mean": out.latents.new_tensor(0.0),
+                "generator_delta_budget": out.latents.new_tensor(0.0),
             }
             local_measure_total = out.latents.new_tensor(0.0)
-            if (
-                cfg.loss.local_drift_weight > 0.0
-                or cfg.loss.local_diffusion_weight > 0.0
-                or cfg.loss.measure_stationarity_weight > 0.0
-                or cfg.loss.measure_trace_weight > 0.0
-                or cfg.loss.measure_tilt_target_weight > 0.0
-                or cfg.loss.response_smoothness_weight > 0.0
-                or cfg.loss.tangent_projection_weight > 0.0
-                or cfg.loss.tangent_compatibility_weight > 0.0
-                or cfg.loss.tangent_spectrum_weight > 0.0
-                or cfg.loss.tangent_shape_weight > 0.0
-            ):
+            if measure_active:
                 measure_terms = local_measure_loss(
                     model=model,
                     latents=out.latents,
@@ -717,6 +900,8 @@ def train_one_epoch(
                     decoded=out.recon,
                     target_model=target_model,
                     target_cond_embed=target_cond_embed,
+                    geometry_reference=geometry_reference,
+                    smoothness_reference=smoothness_reference,
                 )
                 local_measure_total = (
                     cfg.loss.local_drift_weight * measure_terms["local_drift"]
@@ -729,6 +914,9 @@ def train_one_epoch(
                     + cfg.loss.tangent_compatibility_weight * measure_terms["tangent_bundle_compatibility"]
                     + cfg.loss.tangent_spectrum_weight * measure_terms["tangent_spectrum_alignment"]
                     + cfg.loss.tangent_shape_weight * measure_terms["tangent_shape_alignment"]
+                    + cfg.loss.tangent_nontriviality_weight * measure_terms["tangent_nontriviality"]
+                    + cfg.loss.measure_tilt_overreach_weight * measure_terms["measure_tilt_overreach"]
+                    + cfg.loss.generator_delta_weight * measure_terms["generator_delta_budget"]
                 )
 
             identity_loss_value = out.latents.new_tensor(0.0)
@@ -768,8 +956,20 @@ def train_one_epoch(
                 identity_ortho = ((semantic_unit * residual_unit).sum(dim=-1) ** 2).mean()
 
             negative_embed = model.condition_encoder(negative_condition)
-            neg_align = model.condition_alignment_energy(out.latents, negative_embed)
-            pos_align = model.condition_alignment_energy(out.latents, out.cond_embed)
+            neg_align = compute_condition_alignment_scores(
+                model=model,
+                latents=out.latents,
+                condition=negative_condition,
+                condition_catalog=condition_catalog,
+                catalog_readout_mode=cfg.train.condition_catalog_readout_mode,
+            )
+            pos_align = compute_condition_alignment_scores(
+                model=model,
+                latents=out.latents,
+                condition=condition,
+                condition_catalog=condition_catalog,
+                catalog_readout_mode=cfg.train.condition_catalog_readout_mode,
+            )
             _, dyn_neg_per_sample, _ = dynamics_loss(
                 model=model,
                 latents=out.latents.detach() if weights["cond"] == 0 else out.latents,
@@ -816,6 +1016,53 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
         update_measure_target_teacher(target_model, model, cfg.train.measure_target_ema_decay)
+        if measure_active and neighborhood_bank_size > 0 and out.latents.size(1) > 1:
+            with torch.no_grad():
+                smoothness_snapshot = build_smoothness_neighborhood_reference(
+                    model=model,
+                    latents=out.latents.detach(),
+                    video=video,
+                    cond_embed=out.cond_embed.detach(),
+                    signature_mode=cfg.model.response_signature_mode,
+                    decoded=out.recon.detach(),
+                )
+                smoothness_reference = append_smoothness_neighborhood_reference(
+                    smoothness_reference,
+                    smoothness_snapshot,
+                    max_size=neighborhood_bank_size,
+                )
+                if target_model is not None:
+                    target_cond_embed_snapshot = target_model.condition_encoder(condition)
+                    target_latents_snapshot = target_model.encode_video(video, cond_embed=target_cond_embed_snapshot)
+                    target_decoded_snapshot = target_model.decode_video(target_latents_snapshot, target_cond_embed_snapshot)
+                    geometry_snapshot = build_geometry_neighborhood_reference(
+                        model=target_model,
+                        latents=target_latents_snapshot,
+                        video=video,
+                        cond_embed=target_cond_embed_snapshot,
+                        decoded=target_decoded_snapshot,
+                        geometry_knn=cfg.loss.response_geometry_knn,
+                        geometry_temperature=cfg.loss.response_geometry_temperature,
+                        jet_ridge=cfg.loss.response_jet_ridge,
+                        jet_center_weight=cfg.loss.response_jet_center_weight,
+                    )
+                else:
+                    geometry_snapshot = build_geometry_neighborhood_reference(
+                        model=model,
+                        latents=out.latents.detach(),
+                        video=video,
+                        cond_embed=out.cond_embed.detach(),
+                        decoded=out.recon.detach(),
+                        geometry_knn=cfg.loss.response_geometry_knn,
+                        geometry_temperature=cfg.loss.response_geometry_temperature,
+                        jet_ridge=cfg.loss.response_jet_ridge,
+                        jet_center_weight=cfg.loss.response_jet_center_weight,
+                    )
+                geometry_reference = append_geometry_neighborhood_reference(
+                    geometry_reference,
+                    geometry_snapshot,
+                    max_size=neighborhood_bank_size,
+                )
 
         total_metrics["loss"] += loss.item()
         total_metrics["recon"] += recon_loss.item()
@@ -867,6 +1114,7 @@ def train_one_epoch(
         total_metrics["tangent_projector_trace"] += measure_terms["tangent_projector_trace"].item()
         total_metrics["tangent_spectrum_alignment"] += measure_terms["tangent_spectrum_alignment"].item()
         total_metrics["tangent_shape_alignment"] += measure_terms["tangent_shape_alignment"].item()
+        total_metrics["tangent_nontriviality"] += measure_terms["tangent_nontriviality"].item()
         total_metrics["tangent_anisotropy_gap"] += measure_terms["tangent_anisotropy_gap"].item()
         total_metrics["pred_tangent_effective_rank"] += measure_terms["pred_tangent_effective_rank"].item()
         total_metrics["target_tangent_effective_rank"] += measure_terms["target_tangent_effective_rank"].item()
@@ -874,6 +1122,15 @@ def train_one_epoch(
         total_metrics["target_tangent_anisotropy"] += measure_terms["target_tangent_anisotropy"].item()
         total_metrics["pred_tangent_trace"] += measure_terms["pred_tangent_trace"].item()
         total_metrics["target_tangent_trace"] += measure_terms["target_tangent_trace"].item()
+        total_metrics["pred_tangent_spectral_gap"] += measure_terms["pred_tangent_spectral_gap"].item()
+        total_metrics["target_tangent_spectral_gap"] += measure_terms["target_tangent_spectral_gap"].item()
+        total_metrics["measure_tilt_overreach"] += measure_terms["measure_tilt_overreach"].item()
+        total_metrics["generator_base_trace"] += measure_terms["generator_base_trace"].item()
+        total_metrics["generator_delta_trace"] += measure_terms["generator_delta_trace"].item()
+        total_metrics["generator_delta_drift_norm"] += measure_terms["generator_delta_drift_norm"].item()
+        total_metrics["generator_delta_diffusion_norm"] += measure_terms["generator_delta_diffusion_norm"].item()
+        total_metrics["generator_delta_tilt_abs_mean"] += measure_terms["generator_delta_tilt_abs_mean"].item()
+        total_metrics["generator_delta_budget"] += measure_terms["generator_delta_budget"].item()
         total_metrics["identity_acc"] += identity_acc.item()
         total_metrics["semantic_acc"] += semantic_acc.item()
         total_metrics["identity_ortho"] += identity_ortho.item()
@@ -960,6 +1217,7 @@ def evaluate(
     total_tangent_projector_trace = 0.0
     total_tangent_spectrum_alignment = 0.0
     total_tangent_shape_alignment = 0.0
+    total_tangent_nontriviality = 0.0
     total_tangent_anisotropy_gap = 0.0
     total_pred_tangent_effective_rank = 0.0
     total_target_tangent_effective_rank = 0.0
@@ -967,12 +1225,39 @@ def evaluate(
     total_target_tangent_anisotropy = 0.0
     total_pred_tangent_trace = 0.0
     total_target_tangent_trace = 0.0
+    total_pred_tangent_spectral_gap = 0.0
+    total_target_tangent_spectral_gap = 0.0
+    total_measure_tilt_overreach = 0.0
+    total_generator_base_trace = 0.0
+    total_generator_delta_trace = 0.0
+    total_generator_delta_drift_norm = 0.0
+    total_generator_delta_diffusion_norm = 0.0
+    total_generator_delta_tilt_abs_mean = 0.0
+    total_generator_delta_budget = 0.0
     total_identity_acc = 0.0
     total_semantic_acc = 0.0
     total_identity_ortho = 0.0
     total_energy_gap = 0.0
     total_one_step = 0.0
     steps = 0
+    measure_active = (
+        cfg.loss.local_drift_weight > 0.0
+        or cfg.loss.local_diffusion_weight > 0.0
+        or cfg.loss.measure_stationarity_weight > 0.0
+        or cfg.loss.measure_trace_weight > 0.0
+        or cfg.loss.measure_tilt_target_weight > 0.0
+        or cfg.loss.response_smoothness_weight > 0.0
+        or cfg.loss.tangent_projection_weight > 0.0
+        or cfg.loss.tangent_compatibility_weight > 0.0
+        or cfg.loss.tangent_spectrum_weight > 0.0
+        or cfg.loss.tangent_shape_weight > 0.0
+        or cfg.loss.tangent_nontriviality_weight > 0.0
+        or cfg.loss.measure_tilt_overreach_weight > 0.0
+        or cfg.loss.generator_delta_weight > 0.0
+    )
+    neighborhood_bank_size = max(int(cfg.loss.response_neighborhood_bank_size), 0)
+    geometry_reference: GeometryNeighborhoodReference | None = None
+    smoothness_reference: SmoothnessNeighborhoodReference | None = None
 
     for batch in loader:
         video = batch["video"].to(device, non_blocking=True)
@@ -1002,15 +1287,24 @@ def evaluate(
             condition=condition,
             condition_catalog=condition_catalog,
             condition_catalog_tensor=condition_catalog_tensor,
+            catalog_readout_mode=cfg.train.condition_catalog_readout_mode,
         )
         cond_loss_value = nce_condition_loss(logits, cond_targets)
         cond_acc = classification_accuracy(logits, cond_targets)
-        cond_dist = summarize_condition_distribution(logits, cond_targets)
+        cond_dist = summarize_condition_distribution(
+            logits,
+            cond_targets,
+            temperature=cfg.train.query_eval_posterior_temperature,
+        )
         support_terms = support_refinement_loss(
             logits,
             cond_targets,
+            posterior_temperature=cfg.train.query_eval_posterior_temperature,
             p_true_floor=cfg.loss.support_p_true_floor,
+            p_true_ceiling=cfg.loss.support_p_true_ceiling,
             margin_floor=cfg.loss.support_margin_floor,
+            margin_ceiling=cfg.loss.support_margin_ceiling,
+            support_ratio_floor=cfg.loss.support_ratio_floor,
             support_ratio_ceiling=cfg.loss.support_ratio_ceiling,
             gate_p_true=cfg.loss.support_gate_p_true,
             gate_margin=cfg.loss.support_gate_margin,
@@ -1049,6 +1343,7 @@ def evaluate(
             "tangent_projector_trace": out.latents.new_tensor(0.0),
             "tangent_spectrum_alignment": out.latents.new_tensor(0.0),
             "tangent_shape_alignment": out.latents.new_tensor(0.0),
+            "tangent_nontriviality": out.latents.new_tensor(0.0),
             "tangent_anisotropy_gap": out.latents.new_tensor(0.0),
             "pred_tangent_effective_rank": out.latents.new_tensor(0.0),
             "target_tangent_effective_rank": out.latents.new_tensor(0.0),
@@ -1056,19 +1351,17 @@ def evaluate(
             "target_tangent_anisotropy": out.latents.new_tensor(0.0),
             "pred_tangent_trace": out.latents.new_tensor(0.0),
             "target_tangent_trace": out.latents.new_tensor(0.0),
+            "pred_tangent_spectral_gap": out.latents.new_tensor(0.0),
+            "target_tangent_spectral_gap": out.latents.new_tensor(0.0),
+            "measure_tilt_overreach": out.latents.new_tensor(0.0),
+            "generator_base_trace": out.latents.new_tensor(0.0),
+            "generator_delta_trace": out.latents.new_tensor(0.0),
+            "generator_delta_drift_norm": out.latents.new_tensor(0.0),
+            "generator_delta_diffusion_norm": out.latents.new_tensor(0.0),
+            "generator_delta_tilt_abs_mean": out.latents.new_tensor(0.0),
+            "generator_delta_budget": out.latents.new_tensor(0.0),
         }
-        if (
-            cfg.loss.local_drift_weight > 0.0
-            or cfg.loss.local_diffusion_weight > 0.0
-            or cfg.loss.measure_stationarity_weight > 0.0
-            or cfg.loss.measure_trace_weight > 0.0
-            or cfg.loss.measure_tilt_target_weight > 0.0
-            or cfg.loss.response_smoothness_weight > 0.0
-            or cfg.loss.tangent_projection_weight > 0.0
-            or cfg.loss.tangent_compatibility_weight > 0.0
-            or cfg.loss.tangent_spectrum_weight > 0.0
-            or cfg.loss.tangent_shape_weight > 0.0
-        ):
+        if measure_active:
             measure_terms = local_measure_loss(
                 model=model,
                 latents=out.latents,
@@ -1097,6 +1390,8 @@ def evaluate(
                 decoded=out.recon,
                 target_model=target_model,
                 target_cond_embed=target_cond_embed,
+                geometry_reference=geometry_reference,
+                smoothness_reference=smoothness_reference,
             )
         identity_loss_value = out.latents.new_tensor(0.0)
         identity_acc = out.latents.new_tensor(0.0)
@@ -1125,8 +1420,20 @@ def evaluate(
             residual_unit = F.normalize(identity_residual, dim=-1, eps=1e-6)
             identity_ortho = ((semantic_unit * residual_unit).sum(dim=-1) ** 2).mean()
         negative_embed = model.condition_encoder(negative_condition)
-        pos_align = model.condition_alignment_energy(out.latents, out.cond_embed)
-        neg_align = model.condition_alignment_energy(out.latents, negative_embed)
+        pos_align = compute_condition_alignment_scores(
+            model=model,
+            latents=out.latents,
+            condition=condition,
+            condition_catalog=condition_catalog,
+            catalog_readout_mode=cfg.train.condition_catalog_readout_mode,
+        )
+        neg_align = compute_condition_alignment_scores(
+            model=model,
+            latents=out.latents,
+            condition=negative_condition,
+            condition_catalog=condition_catalog,
+            catalog_readout_mode=cfg.train.condition_catalog_readout_mode,
+        )
         _, dyn_neg_per_sample, _ = dynamics_loss(model, out.latents, video, negative_embed, short_span_bias=0.5)
         _, dyn_pos_per_sample, _ = dynamics_loss(model, out.latents, video, out.cond_embed, short_span_bias=0.5)
         energy_pos = pos_align + cfg.loss.condition_dyn_weight * dyn_pos_per_sample
@@ -1180,6 +1487,7 @@ def evaluate(
         total_tangent_projector_trace += measure_terms["tangent_projector_trace"].item()
         total_tangent_spectrum_alignment += measure_terms["tangent_spectrum_alignment"].item()
         total_tangent_shape_alignment += measure_terms["tangent_shape_alignment"].item()
+        total_tangent_nontriviality += measure_terms["tangent_nontriviality"].item()
         total_tangent_anisotropy_gap += measure_terms["tangent_anisotropy_gap"].item()
         total_pred_tangent_effective_rank += measure_terms["pred_tangent_effective_rank"].item()
         total_target_tangent_effective_rank += measure_terms["target_tangent_effective_rank"].item()
@@ -1187,12 +1495,67 @@ def evaluate(
         total_target_tangent_anisotropy += measure_terms["target_tangent_anisotropy"].item()
         total_pred_tangent_trace += measure_terms["pred_tangent_trace"].item()
         total_target_tangent_trace += measure_terms["target_tangent_trace"].item()
+        total_pred_tangent_spectral_gap += measure_terms["pred_tangent_spectral_gap"].item()
+        total_target_tangent_spectral_gap += measure_terms["target_tangent_spectral_gap"].item()
+        total_measure_tilt_overreach += measure_terms["measure_tilt_overreach"].item()
+        total_generator_base_trace += measure_terms["generator_base_trace"].item()
+        total_generator_delta_trace += measure_terms["generator_delta_trace"].item()
+        total_generator_delta_drift_norm += measure_terms["generator_delta_drift_norm"].item()
+        total_generator_delta_diffusion_norm += measure_terms["generator_delta_diffusion_norm"].item()
+        total_generator_delta_tilt_abs_mean += measure_terms["generator_delta_tilt_abs_mean"].item()
+        total_generator_delta_budget += measure_terms["generator_delta_budget"].item()
         total_identity_acc += identity_acc.item()
         total_semantic_acc += semantic_acc.item()
         total_identity_ortho += identity_ortho.item()
         total_energy_gap += energy_gap_value.item()
         total_one_step += one_step_latent.item()
         steps += 1
+        if measure_active and neighborhood_bank_size > 0 and out.latents.size(1) > 1:
+            smoothness_snapshot = build_smoothness_neighborhood_reference(
+                model=model,
+                latents=out.latents.detach(),
+                video=video,
+                cond_embed=out.cond_embed.detach(),
+                signature_mode=cfg.model.response_signature_mode,
+                decoded=out.recon.detach(),
+            )
+            smoothness_reference = append_smoothness_neighborhood_reference(
+                smoothness_reference,
+                smoothness_snapshot,
+                max_size=neighborhood_bank_size,
+            )
+            if target_model is not None:
+                target_cond_embed_snapshot = target_model.condition_encoder(condition)
+                target_latents_snapshot = target_model.encode_video(video, cond_embed=target_cond_embed_snapshot)
+                target_decoded_snapshot = target_model.decode_video(target_latents_snapshot, target_cond_embed_snapshot)
+                geometry_snapshot = build_geometry_neighborhood_reference(
+                    model=target_model,
+                    latents=target_latents_snapshot,
+                    video=video,
+                    cond_embed=target_cond_embed_snapshot,
+                    decoded=target_decoded_snapshot,
+                    geometry_knn=cfg.loss.response_geometry_knn,
+                    geometry_temperature=cfg.loss.response_geometry_temperature,
+                    jet_ridge=cfg.loss.response_jet_ridge,
+                    jet_center_weight=cfg.loss.response_jet_center_weight,
+                )
+            else:
+                geometry_snapshot = build_geometry_neighborhood_reference(
+                    model=model,
+                    latents=out.latents.detach(),
+                    video=video,
+                    cond_embed=out.cond_embed.detach(),
+                    decoded=out.recon.detach(),
+                    geometry_knn=cfg.loss.response_geometry_knn,
+                    geometry_temperature=cfg.loss.response_geometry_temperature,
+                    jet_ridge=cfg.loss.response_jet_ridge,
+                    jet_center_weight=cfg.loss.response_jet_center_weight,
+                )
+            geometry_reference = append_geometry_neighborhood_reference(
+                geometry_reference,
+                geometry_snapshot,
+                max_size=neighborhood_bank_size,
+            )
 
     metrics = {
         "recon": total_recon / max(steps, 1),
@@ -1242,6 +1605,7 @@ def evaluate(
         "tangent_projector_trace": total_tangent_projector_trace / max(steps, 1),
         "tangent_spectrum_alignment": total_tangent_spectrum_alignment / max(steps, 1),
         "tangent_shape_alignment": total_tangent_shape_alignment / max(steps, 1),
+        "tangent_nontriviality": total_tangent_nontriviality / max(steps, 1),
         "tangent_anisotropy_gap": total_tangent_anisotropy_gap / max(steps, 1),
         "pred_tangent_effective_rank": total_pred_tangent_effective_rank / max(steps, 1),
         "target_tangent_effective_rank": total_target_tangent_effective_rank / max(steps, 1),
@@ -1249,6 +1613,15 @@ def evaluate(
         "target_tangent_anisotropy": total_target_tangent_anisotropy / max(steps, 1),
         "pred_tangent_trace": total_pred_tangent_trace / max(steps, 1),
         "target_tangent_trace": total_target_tangent_trace / max(steps, 1),
+        "pred_tangent_spectral_gap": total_pred_tangent_spectral_gap / max(steps, 1),
+        "target_tangent_spectral_gap": total_target_tangent_spectral_gap / max(steps, 1),
+        "measure_tilt_overreach": total_measure_tilt_overreach / max(steps, 1),
+        "generator_base_trace": total_generator_base_trace / max(steps, 1),
+        "generator_delta_trace": total_generator_delta_trace / max(steps, 1),
+        "generator_delta_drift_norm": total_generator_delta_drift_norm / max(steps, 1),
+        "generator_delta_diffusion_norm": total_generator_delta_diffusion_norm / max(steps, 1),
+        "generator_delta_tilt_abs_mean": total_generator_delta_tilt_abs_mean / max(steps, 1),
+        "generator_delta_budget": total_generator_delta_budget / max(steps, 1),
         "identity_acc": total_identity_acc / max(steps, 1),
         "semantic_acc": total_semantic_acc / max(steps, 1),
         "identity_ortho": total_identity_ortho / max(steps, 1),
@@ -1271,6 +1644,7 @@ def evaluate(
                 plan_core_alpha=cfg.train.query_eval_plan_core_alpha,
                 posterior_temperature=cfg.train.query_eval_posterior_temperature,
                 max_samples=cfg.train.query_eval_max_samples,
+                catalog_readout_mode=cfg.train.condition_catalog_readout_mode,
             )
         )
     return metrics
@@ -1399,45 +1773,18 @@ def main() -> None:
             best_recon_val = recon_score
             torch.save(checkpoint, output_dir / "best_recon.pt")
 
-        if condition_catalog is None:
+        measure_score, measure_selection_info = compute_measure_checkpoint_score(
+            val_metrics=val_metrics,
+            cfg=cfg,
+        )
+        checkpoint["selection_score_measure"] = measure_selection_info
+        if measure_score > best_measure_score:
+            best_measure_score = measure_score
+            torch.save(checkpoint, output_dir / "best_measure.pt")
             if cfg.train.checkpoint_selection_mode == "measure":
-                trace_penalty = 0.25 * val_metrics["measure_trace_alignment"] if cfg.loss.measure_trace_weight > 0.0 else 0.0
-                tilt_penalty = 0.25 * val_metrics["measure_tilt_alignment"] if cfg.loss.measure_tilt_target_weight > 0.0 else 0.0
-                tangent_projection_penalty = 0.25 * val_metrics["tangent_projection"] if cfg.loss.tangent_projection_weight > 0.0 else 0.0
-                tangent_bundle_penalty = 0.25 * val_metrics["tangent_bundle_compatibility"] if cfg.loss.tangent_compatibility_weight > 0.0 else 0.0
-                tangent_spectrum_penalty = 0.02 * val_metrics["tangent_spectrum_alignment"] if cfg.loss.tangent_spectrum_weight > 0.0 else 0.0
-                tangent_shape_penalty = 0.10 * val_metrics["tangent_shape_alignment"] if cfg.loss.tangent_shape_weight > 0.0 else 0.0
-                measure_score = -(
-                    val_metrics["measure_stationarity"]
-                    + 0.5 * val_metrics["response_smoothness"]
-                    + 0.25 * val_metrics["local_drift"]
-                    + 0.25 * val_metrics["local_diffusion"]
-                    + trace_penalty
-                    + tilt_penalty
-                    + tangent_projection_penalty
-                    + tangent_bundle_penalty
-                    + tangent_spectrum_penalty
-                    + tangent_shape_penalty
-                )
-                checkpoint["selection_score_measure"] = {
-                    "mode": "measure",
-                    "measure_score": measure_score,
-                    "measure_stationarity": val_metrics["measure_stationarity"],
-                    "measure_trig_stationarity": val_metrics["measure_trig_stationarity"],
-                    "measure_trace_alignment": val_metrics["measure_trace_alignment"],
-                    "measure_tilt_alignment": val_metrics["measure_tilt_alignment"],
-                    "response_smoothness": val_metrics["response_smoothness"],
-                    "local_drift": val_metrics["local_drift"],
-                    "local_diffusion": val_metrics["local_diffusion"],
-                    "tangent_projection": val_metrics["tangent_projection"],
-                    "tangent_bundle_compatibility": val_metrics["tangent_bundle_compatibility"],
-                    "tangent_spectrum_alignment": val_metrics["tangent_spectrum_alignment"],
-                    "tangent_shape_alignment": val_metrics["tangent_shape_alignment"],
-                }
-                if measure_score > best_measure_score:
-                    best_measure_score = measure_score
-                    torch.save(checkpoint, output_dir / "best_measure.pt")
-                    torch.save(checkpoint, output_dir / "best.pt")
+                torch.save(checkpoint, output_dir / "best.pt")
+
+        if condition_catalog is None:
             if recon_score < best_support_score or best_support_score == -math.inf:
                 best_support_score = recon_score
                 checkpoint["selection_score"] = -recon_score
@@ -1454,45 +1801,6 @@ def main() -> None:
                 checkpoint["selection_score"] = support_score
                 torch.save(checkpoint, output_dir / "best_support.pt")
                 if cfg.train.checkpoint_selection_mode == "support":
-                    torch.save(checkpoint, output_dir / "best.pt")
-
-            if cfg.train.checkpoint_selection_mode == "measure":
-                trace_penalty = 0.25 * val_metrics["measure_trace_alignment"] if cfg.loss.measure_trace_weight > 0.0 else 0.0
-                tilt_penalty = 0.25 * val_metrics["measure_tilt_alignment"] if cfg.loss.measure_tilt_target_weight > 0.0 else 0.0
-                tangent_projection_penalty = 0.25 * val_metrics["tangent_projection"] if cfg.loss.tangent_projection_weight > 0.0 else 0.0
-                tangent_bundle_penalty = 0.25 * val_metrics["tangent_bundle_compatibility"] if cfg.loss.tangent_compatibility_weight > 0.0 else 0.0
-                tangent_spectrum_penalty = 0.02 * val_metrics["tangent_spectrum_alignment"] if cfg.loss.tangent_spectrum_weight > 0.0 else 0.0
-                tangent_shape_penalty = 0.10 * val_metrics["tangent_shape_alignment"] if cfg.loss.tangent_shape_weight > 0.0 else 0.0
-                measure_score = -(
-                    val_metrics["measure_stationarity"]
-                    + 0.5 * val_metrics["response_smoothness"]
-                    + 0.25 * val_metrics["local_drift"]
-                    + 0.25 * val_metrics["local_diffusion"]
-                    + trace_penalty
-                    + tilt_penalty
-                    + tangent_projection_penalty
-                    + tangent_bundle_penalty
-                    + tangent_spectrum_penalty
-                    + tangent_shape_penalty
-                )
-                checkpoint["selection_score_measure"] = {
-                    "mode": "measure",
-                    "measure_score": measure_score,
-                    "measure_stationarity": val_metrics["measure_stationarity"],
-                    "measure_trig_stationarity": val_metrics["measure_trig_stationarity"],
-                    "measure_trace_alignment": val_metrics["measure_trace_alignment"],
-                    "measure_tilt_alignment": val_metrics["measure_tilt_alignment"],
-                    "response_smoothness": val_metrics["response_smoothness"],
-                    "local_drift": val_metrics["local_drift"],
-                    "local_diffusion": val_metrics["local_diffusion"],
-                    "tangent_projection": val_metrics["tangent_projection"],
-                    "tangent_bundle_compatibility": val_metrics["tangent_bundle_compatibility"],
-                    "tangent_spectrum_alignment": val_metrics["tangent_spectrum_alignment"],
-                    "tangent_shape_alignment": val_metrics["tangent_shape_alignment"],
-                }
-                if measure_score > best_measure_score:
-                    best_measure_score = measure_score
-                    torch.save(checkpoint, output_dir / "best_measure.pt")
                     torch.save(checkpoint, output_dir / "best.pt")
 
             if cfg.train.query_eval_enabled and "query_exec_mse" in val_metrics:

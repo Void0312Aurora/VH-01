@@ -28,6 +28,8 @@ $$
 | --- | --- | --- |
 | `R_{i,j,l}` | [dynamics_loss](/home/void0312/AIGC/VH-01/src/vh_mvp/losses/objectives.py) 与 [response_signature](/home/void0312/AIGC/VH-01/src/vh_mvp/losses/objectives.py) | 已实现 |
 | 局部基点 `x` | [chart_latents](/home/void0312/AIGC/VH-01/src/vh_mvp/models/mvp.py) 与 [trajectory_state](/home/void0312/AIGC/VH-01/src/vh_mvp/models/mvp.py) | 已实现，但仍偏弱 |
+| 经验局部样本云 `\mathcal N_x^{(k)} \subset \mathcal Z^T \cap U_x` | [response_jet](/home/void0312/AIGC/VH-01/src/vh_mvp/losses/objectives.py) 与 [local_neighbor_smoothness_loss](/home/void0312/AIGC/VH-01/src/vh_mvp/losses/objectives.py) | 已从纯 batch 图升级为跨 batch 经验邻域池近似 |
+| 局部联络/离散 transport | [GeometryNeighborhoodReference](/home/void0312/AIGC/VH-01/src/vh_mvp/losses/objectives.py) 与 [tangent_bundle_compatibility](/home/void0312/AIGC/VH-01/src/vh_mvp/losses/objectives.py) | 已接入第一版 cross-reference 正交对齐 |
 | 局部切向子空间 `T_x\mathcal M_T` | [trajectory_tangent_frame](/home/void0312/AIGC/VH-01/src/vh_mvp/models/mvp.py) 与 [trajectory_tangent_projector](/home/void0312/AIGC/VH-01/src/vh_mvp/models/mvp.py) | 已接入第一版 |
 | 漂移 `b_c(x)` | [trajectory_drift](/home/void0312/AIGC/VH-01/src/vh_mvp/models/mvp.py) | 已实现 |
 | 切空间内部结构 `\Sigma_x` | [local_tangent_covariance](/home/void0312/AIGC/VH-01/src/vh_mvp/models/mvp.py) | 已接入第一版 |
@@ -54,5 +56,12 @@ $$
 
 1. 保持局部切向标架与切向兼容量这条主线，把 `A_x` 明确限制为 `U_x\Sigma_x U_x^\top`；
 2. 用谱、迹、各向异性等基不变量来约束 `\Sigma_x`，而不是只盯环境坐标里的非对角项；
-3. 重新验证 `measure_stationarity`、`trace`、`tangent_spectrum_alignment` 与切向兼容指标；
-4. 在切空间内部结构更可信之后，再继续讨论如何把响应不变量稳定地映射为非平凡的 `\Sigma_x`。
+3. 已将当前分散的 drift / diffusion / tangent / measure 组件收口成显式 `\mathcal L_c` 对象；
+4. 继续验证 `measure_stationarity`、`trace`、`tangent_spectrum_alignment` 与切向兼容指标在新对象边界下的行为；
+5. 在切空间内部结构更可信之后，再继续讨论如何把响应不变量稳定地映射为非平凡的 `\Sigma_x`；
+6. 若后续确有必要，再单独讨论 `\mathcal L_0 + \delta \mathcal L_c` 的更深层分解。
+
+这一项的专门设计与冻结清单见：
+
+1. [lc-first-class-design.md](/home/void0312/AIGC/VH-01/docs/lc-first-class-design.md#L1)
+2. [lc-first-class-frozen-checklist.md](/home/void0312/AIGC/VH-01/docs/lc-first-class-frozen-checklist.md#L1)

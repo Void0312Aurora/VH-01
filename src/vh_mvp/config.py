@@ -40,6 +40,9 @@ class ModelConfig:
     chart_residual_scale: float = 0.1
     chart_temporal_hidden_dim: int = 128
     chart_temporal_kernel_size: int = 3
+    encoder_condition_mode: str = "residual_temporal"
+    encoder_condition_hidden_dim: int = 128
+    encoder_condition_scale: float = 0.1
     state_cov_proj_dim: int = 0
     response_context_dim: int = 0
     response_signature_mode: str = "span_stats"
@@ -75,6 +78,7 @@ class TrainConfig:
     query_eval_plan_core_alpha: float = 0.50
     query_eval_posterior_temperature: float = 1.0
     query_eval_max_samples: int = 80
+    condition_catalog_readout_mode: str = "model"
     checkpoint_selection_mode: str = "support"
     query_checkpoint_fallback_budget: float = 0.05
     query_checkpoint_exec_weight: float = 1.0
@@ -109,7 +113,10 @@ class LossConfig:
     support_margin_weight: float = 0.0
     support_ratio_weight: float = 0.0
     support_p_true_floor: float = 0.0
+    support_p_true_ceiling: float = 1.0
     support_margin_floor: float = 0.0
+    support_margin_ceiling: float = 1.0
+    support_ratio_floor: float = 0.0
     support_ratio_ceiling: float = 1.0
     support_gate_p_true: float = 0.0
     support_gate_margin: float = 0.0
@@ -122,6 +129,7 @@ class LossConfig:
     response_signature_temperature: float = 0.5
     response_geometry_knn: int = 8
     response_geometry_temperature: float = 0.5
+    response_neighborhood_bank_size: int = 128
     response_jet_ridge: float = 1e-3
     response_jet_center_weight: float = 1.0
     response_tau_ridge: float = 1e-3
@@ -135,6 +143,9 @@ class LossConfig:
     tangent_compatibility_weight: float = 0.0
     tangent_spectrum_weight: float = 0.0
     tangent_shape_weight: float = 0.0
+    tangent_nontriviality_weight: float = 0.0
+    measure_tilt_overreach_weight: float = 0.0
+    generator_delta_weight: float = 0.0
     diffusion_target_mode: str = "full"
     measure_target_mode: str = "chart_moments"
     measure_target_blend: float = 0.5
